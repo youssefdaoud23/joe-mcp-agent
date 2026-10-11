@@ -1,0 +1,45 @@
+[Unit]
+Description=Joe Cloud Managed Node Agent
+After=network-online.target joe-mcp-host-bridge.service
+Wants=network-online.target joe-mcp-host-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=/usr/bin/python3 -m src.node_agent
+Restart=always
+RestartSec=3
+User=root
+Group=root
+UMask=0077
+Environment=JOE_NODE_NAME=@NODE_NAME@
+Environment=JOE_NODE_ROLE=managed
+Environment=JOE_VERSION=@JOE_VERSION@
+Environment=JOE_MODE=guarded
+Environment=JOE_HOST_ROOT=/
+Environment=JOE_PROJECT_ROOT=@PROJECT_ROOT@
+Environment=JOE_WRITE_ROOTS=/var/lib/joe-mcp-work
+Environment=JOE_ACTIONS_FILE=/var/lib/joe-mcp-work/actions.json
+Environment=JOE_WORKSPACES_FILE=/var/lib/joe-mcp-work/workspaces.json
+Environment=JOE_BRIDGE_SOCKET=/run/joe-mcp/bridge.sock
+Environment=JOE_DEVICE_CONFIG=/var/lib/joe-mcp-agent/config.json
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/joe-mcp-agent
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

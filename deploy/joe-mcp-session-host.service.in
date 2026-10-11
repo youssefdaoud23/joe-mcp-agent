@@ -1,0 +1,37 @@
+[Unit]
+Description=Joe MCP Persistent Session Host
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=@RUNTIME_ROOT@
+ExecStart=/usr/bin/python3 @RUNTIME_ROOT@/scripts/persistent_session_host.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=joe-mcp-session
+RuntimeDirectoryMode=0700
+Environment=JOE_TMUX_SOCKET=/run/joe-mcp-session/tmux.sock
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=@PROJECT_ROOT@ /var/lib/joe-mcp-work/persistent-sessions
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

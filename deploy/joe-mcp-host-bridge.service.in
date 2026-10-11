@@ -1,0 +1,41 @@
+[Unit]
+Description=Joe MCP Host Bridge
+Wants=joe-mcp-session-host.service
+After=network.target joe-mcp-session-host.service
+
+[Service]
+Type=simple
+WorkingDirectory=@RUNTIME_ROOT@
+ExecStart=/usr/bin/python3 -m src.host_bridge
+Restart=on-failure
+RestartSec=2
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=joe-mcp
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+Environment=JOE_BRIDGE_SOCKET=/run/joe-mcp/bridge.sock
+Environment=JOE_NODE_ROLE=controller
+Environment=JOE_ACTIONS_FILE=/var/lib/joe-mcp-work/actions.json
+Environment=JOE_PROJECT_ROOT=@PROJECT_ROOT@
+Environment=JOE_WRITE_ROOTS=@PROJECT_ROOT@,/var/lib/joe-mcp-work
+Environment=JOE_WORKSPACES_FILE=/var/lib/joe-mcp-work/workspaces.json
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@PROJECT_ROOT@ /var/lib/joe-mcp-work
+ReadOnlyPaths=-@PROJECT_ROOT@/.git/config -@PROJECT_ROOT@/.git/config.worktree -@PROJECT_ROOT@/.git/hooks -@PROJECT_ROOT@/.secrets -@PROJECT_ROOT@/data/auth -@PROJECT_ROOT@/data/audit -@PROJECT_ROOT@/data/devices -@PROJECT_ROOT@/data/sessions
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

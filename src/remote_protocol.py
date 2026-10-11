@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+PROTOCOL_VERSION = 1
+LIFECYCLE_UPDATE_AGENT = "__update_managed_agent__"
+LIFECYCLE_SHUTDOWN_AGENT = "__shutdown_managed_agent__"
+MAX_ARGUMENT_BYTES = 64 * 1024
+MAX_RESULT_BYTES = 1_500_000
+MAX_JOB_SECONDS = 30
+MAX_QUEUE_PER_DEVICE = 20
+
+READ_REMOTE_TOOLS = frozenset({
+    "server_info",
+    "node_policy",
+    "get_config",
+    "managed_update_status",
+    "host_info",
+    "list_directory",
+    "directory_tree",
+    "read_text_file",
+    "read_file",
+    "read_multiple_files",
+    "path_info",
+    "get_file_info",
+    "file_inspect",
+    "read_url",
+    "list_processes",
+    "process_info",
+    "list_open_ports",
+    "search_files",
+    "search_content",
+    "start_search",
+    "get_search_results",
+    "list_searches",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_branches",
+    "list_services",
+    "service_status",
+    "list_timers",
+    "timer_status",
+    "unit_file",
+    "journal_logs",
+    "docker_containers",
+    "docker_container_status",
+    "docker_logs",
+    "read_process_output",
+    "list_sessions",
+    "workspace_profiles",
+    "sqlite_tables",
+    "sqlite_schema",
+    "sqlite_query",
+    "sqlite_table_stats",
+    "localhost_http",
+    "list_trash",
+    "deployment_preflight",
+    "deployment_verify",
+})
+
+ACTION_REMOTE_TOOLS = frozenset({
+    "stop_search",
+    "git_stage",
+    "git_commit",
+    "git_push",
+    "git_branch_create",
+    "git_branch_switch",
+    "git_restore_to_commit",
+    "git_restore_previous",
+    "service_action",
+    "docker_action",
+    "start_process",
+    "start_workspace_python",
+    "start_workspace_python_code",
+    "start_workspace_node_check",
+    "start_workspace_pytest",
+    "interact_with_process",
+    "kill_process",
+    "write_file",
+    "write_pdf",
+    "edit_file",
+    "edit_block",
+    "edit_spreadsheet_range",
+    "force_terminate",
+    "create_directory",
+    "move_file",
+    "copy_file",
+    "trash_path",
+    "restore_trash",
+    "purge_trash",
+    "deployment_restore_previous",
+})
+
+ALL_REMOTE_TOOLS = READ_REMOTE_TOOLS | ACTION_REMOTE_TOOLS

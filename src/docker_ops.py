@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import fnmatch
+import re
+import subprocess
+from typing import Any
+
+from src.action_policy import authorize_docker_action
+from src.security import redact_text
+
+
+DOCKER_ENV = {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "HOME": "/",
+    "DOCKER_HOST": "unix:///var/run/docker.sock",
+    "DOCKER_CONFIG": "/nonexistent",
+    "NO_COLOR": "1",
+}
+CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+MAX_RESULTS = 500
+MAX_OUTPUT_BYTES = 500_000
+MAX_LOG_LINES = 500
+MAX_LOG_SINCE_MINUTES = 10_080
+MAX_LOG_STREAM_BYTES = 1_000_000
+MAX_LOG_MESSAGE_CHARS = 4000
+
+
+class DockerError(RuntimeError):
+    pass
+
+
+def _run(args: list[str], timeout: float = 8.0, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
+    try:
+        completed = subprocess.run(
+            ["docker", *args],
+            env=DOCKER_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise DockerError("docker CLI is unavailable on the host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerError("docker operation timed out") from exc
+    if completed.returncode != 0:
+        error = completed.stderr[:4000].decode("utf-8", errors="replace").strip()
+        raise DockerError(error or f"docker exited with status {completed.returncode}")
+    raw = completed.stdout
+    if len(raw) > max_bytes:
+        raw = raw[:max_bytes]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _run_logs(args: list[str], timeout: float = 10.0) -> tuple[str, str]:
+    try:
+        completed = subprocess.run(
+            ["docker", *args],
+            env=DOCKER_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise DockerError("docker CLI is unavailable on the host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerError("docker logs operation timed out") from exc
+    if completed.returncode != 0:
+        error = completed.stderr[:4000].decode("utf-8", errors="replace").strip()
+        raise DockerError(error or f"docker logs exited with status {completed.returncode}")
+    stdout = completed.stdout[:MAX_LOG_STREAM_BYTES].decode("utf-8", errors="replace")
+    stderr = completed.stderr[:MAX_LOG_STREAM_BYTES].decode("utf-8", errors="replace")
+    return stdout, stderr
+
+
+def normalize_container(container: str) -> str:
+    value = str(container or "").strip()
+    if not value or not CONTAINER_RE.fullmatch(value):
+        raise ValueError("container name/id contains unsupported characters")
+    return value
+
+
+def docker_containers(pattern: str = "*", max_results: int = 200) -> dict[str, Any]:
+    if not pattern or len(pattern) > 256:
+        raise ValueError("pattern must contain 1 to 256 characters")
+    limit = max(1, min(int(max_results), MAX_RESULTS))
+    template = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Ports}}"
+    output = _run(["ps", "--all", "--no-trunc", "--format", template])
+    needle = pattern.lower()
+    containers: list[dict[str, str]] = []
+    matched_total = 0
+    for line in output.splitlines():
+        parts = line.split("\t", 5)
+        if len(parts) != 6:
+            continue
+        container_id, name, image, state, status, ports = parts
+        if not fnmatch.fnmatchcase(name.lower(), needle):
+            continue
+        matched_total += 1
+        if len(containers) < limit:
+            containers.append({
+                "id": container_id,
+                "name": name,
+                "image": image,
+                "state": state,
+                "status": status,
+                "ports": ports,
+            })
+    return {
+        "pattern": pattern,
+        "containers": containers,
+        "result_count": len(containers),
+        "matched_total": matched_total,
+        "truncated": matched_total > len(containers),
+    }
+
+
+def docker_container_status(container: str) -> dict[str, Any]:
+    target = normalize_container(container)
+    template = (
+        "{{.Id}}\t{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t"
+        "{{.State.Running}}\t{{.State.Pid}}\t{{.RestartCount}}\t"
+        "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t{{.Created}}"
+    )
+    output = _run(["inspect", "--type=container", "--format", template, target], max_bytes=64_000).strip()
+    parts = output.split("\t")
+    if len(parts) != 9:
+        raise DockerError("docker returned an unexpected container status format")
+    container_id, name, image, state, running, pid, restarts, health, created = parts
+    return {
+        "id": container_id,
+        "name": name.lstrip("/"),
+        "image": image,
+        "state": state,
+        "running": running.lower() == "true",
+        "pid": _to_int(pid),
+        "restart_count": _to_int(restarts),
+        "health": health or None,
+        "created": created or None,
+    }
+
+
+def docker_action(container: str, action: str) -> dict[str, Any]:
+    target = normalize_container(container)
+    normalized_action = str(action or "").strip().lower()
+    authorize_docker_action(target, normalized_action)
+
+    before = docker_container_status(target)
+    _run([normalized_action, target], timeout=30.0, max_bytes=4_000)
+    after = docker_container_status(target)
+    return {
+        "container": target,
+        "action": normalized_action,
+        "before": {
+            "state": before.get("state"),
+            "running": before.get("running"),
+            "pid": before.get("pid"),
+            "restart_count": before.get("restart_count"),
+        },
+        "after": {
+            "state": after.get("state"),
+            "running": after.get("running"),
+            "pid": after.get("pid"),
+            "restart_count": after.get("restart_count"),
+        },
+    }
+
+
+def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dict[str, Any]:
+    target = normalize_container(container)
+    line_limit = max(1, min(int(lines), MAX_LOG_LINES))
+    since = max(0, min(int(since_minutes), MAX_LOG_SINCE_MINUTES))
+    args = ["logs", "--timestamps", f"--tail={line_limit}"]
+    if since:
+        args.append(f"--since={since}m")
+    args.append(target)
+    stdout, stderr = _run_logs(args)
+
+    raw_entries: list[tuple[str, int, str, str | None, str]] = []
+    sequence = 0
+    for stream, text in (("stdout", stdout), ("stderr", stderr)):
+        for line in text.splitlines():
+            sequence += 1
+            timestamp: str | None = None
+            message = line
+            if " " in line:
+                first, remainder = line.split(" ", 1)
+                if "T" in first and (first.endswith("Z") or "+" in first):
+                    timestamp = first
+                    message = remainder
+            sort_key = timestamp or f"~{sequence:09d}"
+            raw_entries.append((sort_key, sequence, stream, timestamp, message))
+
+    raw_entries.sort(key=lambda item: (item[0], item[1]))
+    selected = raw_entries[-line_limit:]
+    entries = [
+        {
+            "timestamp": timestamp,
+            "stream": stream,
+            "message": redact_text(message, MAX_LOG_MESSAGE_CHARS),
+        }
+        for _key, _sequence, stream, timestamp, message in selected
+    ]
+    return {
+        "container": target,
+        "requested_lines": line_limit,
+        "since_minutes": since,
+        "entries": entries,
+        "entry_count": len(entries),
+        "redaction": "enabled",
+    }
+
+
+def _to_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
