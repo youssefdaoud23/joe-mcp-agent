@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JOE_VERSION="0.27.4"
+JOE_VERSION="0.28.0"
 SERVER=""
 ENROLL=""
 NODE_NAME="$(hostname 2>/dev/null || echo managed-node)"

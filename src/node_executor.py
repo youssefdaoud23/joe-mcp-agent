@@ -58,6 +58,13 @@ from src.bridge_client import (
 from src.lifecycle_bridge import git_restore_previous as bridge_git_restore_previous, git_restore_to_commit as bridge_git_restore_to_commit
 from src.deployment_ops import deployment_preflight_data, deployment_restore_previous_data, deployment_verify_data
 from src.file_inspect import directory_tree as inspect_directory_tree, inspect_file
+from src.filesystem_scope import (
+    FULL_HOST_MODE,
+    can_read as filesystem_can_read,
+    can_write as filesystem_can_write,
+    default_filesystem_policy,
+    normalize_filesystem_policy,
+)
 from src.rich_file import read_multiple_rich_files, read_rich_file, rich_file_info
 from src.url_read import read_url
 from src.process_ops import list_open_ports as inspect_open_ports, list_processes as inspect_processes, process_info as inspect_process_info
@@ -76,8 +83,9 @@ class NodeExecutor:
     def __init__(self, host_root: Path | None = None) -> None:
         self.host_root = host_root or Path(os.getenv("JOE_HOST_ROOT", "/host"))
         self.node_name = os.getenv("JOE_NODE_NAME", "managed-node")
-        self.version = os.getenv("JOE_VERSION", "0.27.4")
+        self.version = os.getenv("JOE_VERSION", "0.28.0")
         self.mode = os.getenv("JOE_MODE", "guarded")
+        self.filesystem_policy = default_filesystem_policy()
         self.searches = SearchManager(self.host_root)
         self._tools: dict[str, Callable[..., dict[str, Any]]] = {
             "server_info": self.server_info,
@@ -147,7 +155,7 @@ class NodeExecutor:
             "restore_trash": bridge_restore_trash,
             "purge_trash": bridge_purge_trash,
             "list_sessions": bridge_list_sessions,
-            "workspace_profiles": bridge_workspace_profiles,
+            "workspace_profiles": self.workspace_profiles,
             "sqlite_tables": bridge_sqlite_tables,
             "sqlite_schema": bridge_sqlite_schema,
             "sqlite_query": bridge_sqlite_query,
@@ -162,6 +170,146 @@ class NodeExecutor:
     def _json_size(value: Any) -> int:
         return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
+    def set_filesystem_policy(self, policy: dict[str, Any] | None) -> dict[str, Any]:
+        normalized = normalize_filesystem_policy(policy)
+        if normalized != self.filesystem_policy:
+            self.searches = SearchManager(self.host_root)
+        self.filesystem_policy = normalized
+        return normalized
+
+    def _restricted(self) -> bool:
+        return str(self.filesystem_policy.get("mode") or FULL_HOST_MODE) != FULL_HOST_MODE
+
+    def _resolved_scope_path(self, path: str) -> str:
+        candidate = safe_host_path(path, self.host_root)
+        resolved = candidate.resolve(strict=False)
+        root = self.host_root.resolve(strict=False)
+        if root == Path("/"):
+            return str(resolved)
+        if resolved == root:
+            return "/"
+        try:
+            return "/" + resolved.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise NodeExecutionError("Path resolves outside the managed host root") from exc
+
+    def _require_path(self, path: str, *, write: bool = False) -> str:
+        resolved = self._resolved_scope_path(path)
+        allowed = filesystem_can_write(self.filesystem_policy, resolved) if write else filesystem_can_read(self.filesystem_policy, resolved)
+        if not allowed:
+            access = "write" if write else "read"
+            raise NodeExecutionError(f"Filesystem {access} denied outside configured device scope")
+        return resolved
+
+    def _workspace_root(self, workspace: str) -> str:
+        data = bridge_workspace_profiles()
+        for item in data.get("workspaces", []) if isinstance(data, dict) else []:
+            if isinstance(item, dict) and str(item.get("name") or "") == str(workspace or ""):
+                root = str(item.get("root") or "")
+                if root:
+                    return root
+        raise NodeExecutionError("Workspace is unavailable")
+
+    def _require_workspace(self, workspace: str, *, write: bool = False) -> str:
+        root = self._workspace_root(workspace)
+        self._require_path(root, write=write)
+        return root
+
+    def _enforce_filesystem_scope(self, tool: str, arguments: dict[str, Any]) -> None:
+        if not self._restricted():
+            return
+        read_path_tools = {
+            "list_directory", "directory_tree", "read_text_file", "read_file", "path_info",
+            "get_file_info", "file_inspect", "search_files", "search_content",
+        }
+        write_path_tools = {
+            "write_file", "write_pdf", "edit_file", "edit_spreadsheet_range", "create_directory", "trash_path",
+        }
+        git_read_tools = {"git_status", "git_diff", "git_log", "git_branches"}
+        git_write_tools = {
+            "git_stage", "git_commit", "git_push", "git_branch_create", "git_branch_switch",
+            "git_restore_to_commit", "git_restore_previous",
+        }
+        workspace_read_tools = {
+            "sqlite_tables", "sqlite_schema", "sqlite_query", "sqlite_table_stats", "localhost_http",
+            "deployment_preflight", "deployment_verify",
+        }
+        workspace_write_tools = {
+            "start_workspace_python", "start_workspace_python_code", "start_workspace_pytest",
+            "deployment_restore_previous",
+        }
+        restricted_session_tools = {
+            "start_process", "read_process_output", "interact_with_process", "kill_process", "force_terminate",
+            "list_sessions", "list_processes", "process_info", "list_open_ports",
+        }
+        restricted_global_tools = {
+            "list_services", "service_status", "service_action", "list_timers", "timer_status", "unit_file", "journal_logs",
+            "docker_containers", "docker_container_status", "docker_action", "docker_logs",
+        }
+        safe_nonfilesystem_tools = {
+            "server_info", "node_policy", "get_config", "managed_update_status", "host_info", "read_url",
+            "get_search_results", "list_searches", "stop_search", "workspace_profiles",
+        }
+        if tool in restricted_session_tools:
+            raise NodeExecutionError("Process and session tools are disabled while device filesystem scope is restricted")
+        if tool in restricted_global_tools:
+            raise NodeExecutionError("System-wide service, journal, and container tools are disabled while device filesystem scope is restricted")
+        if tool in {"list_trash", "restore_trash", "purge_trash"}:
+            raise NodeExecutionError("Global trash tools are disabled while device filesystem scope is restricted")
+        if tool == "read_file" and bool(arguments.get("isUrl") if arguments.get("is_url") is None else arguments.get("is_url")):
+            return
+        if tool in read_path_tools:
+            key = "root" if tool in {"search_files", "search_content"} else "path"
+            self._require_path(str(arguments.get(key) or "/"), write=False)
+            return
+        if tool == "start_search":
+            root = str(arguments.get("root") or arguments.get("path") or "")
+            if root:
+                self._require_path(root, write=False)
+            else:
+                raise NodeExecutionError("Restricted device searches require an explicit approved root")
+            return
+        if tool == "read_multiple_files":
+            paths = arguments.get("paths")
+            if not isinstance(paths, list) or not paths:
+                raise NodeExecutionError("Restricted multi-file reads require explicit paths")
+            for path in paths:
+                self._require_path(str(path), write=False)
+            return
+        if tool in write_path_tools:
+            target_path = str(arguments.get("outputPath") or arguments.get("path") or "") if tool == "write_pdf" else str(arguments.get("path") or "")
+            self._require_path(target_path, write=True)
+            return
+        if tool == "edit_block":
+            self._require_path(str(arguments.get("file_path") or ""), write=True)
+            return
+        if tool == "copy_file":
+            self._require_path(str(arguments.get("source") or ""), write=False)
+            self._require_path(str(arguments.get("destination") or ""), write=True)
+            return
+        if tool == "move_file":
+            self._require_path(str(arguments.get("source") or ""), write=True)
+            self._require_path(str(arguments.get("destination") or ""), write=True)
+            return
+        if tool in git_read_tools:
+            self._require_path(str(arguments.get("path") or ""), write=False)
+            return
+        if tool in git_write_tools:
+            self._require_path(str(arguments.get("path") or ""), write=True)
+            return
+        if tool in workspace_read_tools:
+            self._require_workspace(str(arguments.get("workspace") or ""), write=False)
+            return
+        if tool == "start_workspace_node_check":
+            self._require_workspace(str(arguments.get("workspace") or ""), write=False)
+            return
+        if tool in workspace_write_tools:
+            self._require_workspace(str(arguments.get("workspace") or ""), write=True)
+            return
+        if tool in safe_nonfilesystem_tools:
+            return
+        raise NodeExecutionError("Remote tool is not classified for restricted filesystem scope")
+
     def execute(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         name = str(tool or "").strip()
         if name not in ALL_REMOTE_TOOLS or name not in self._tools:
@@ -170,6 +318,7 @@ class NodeExecutor:
             raise NodeExecutionError("Remote tool arguments must be an object")
         if self._json_size(arguments) > MAX_ARGUMENT_BYTES:
             raise NodeExecutionError("Remote tool arguments exceed size limit")
+        self._enforce_filesystem_scope(name, arguments)
         target = self._tools[name]
         try:
             inspect.signature(target).bind(**arguments)
@@ -201,13 +350,47 @@ class NodeExecutor:
 
     def node_policy(self) -> dict[str, Any]:
         data = bridge_ping()
+        write_policy = dict(data.get("write_policy", {}) or {})
+        if self._restricted():
+            for key in ("roots", "workspace_mutation_roots"):
+                values = write_policy.get(key, [])
+                write_policy[key] = [
+                    str(path) for path in values
+                    if isinstance(path, str) and filesystem_can_write(self.filesystem_policy, path)
+                ]
         return {
-            "write_policy": data.get("write_policy", {}),
+            "write_policy": write_policy,
             "action_policy": data.get("action_policy", {}),
             "allowed_commands": data.get("allowed_commands", []),
             "persistent_sessions": data.get("persistent_sessions", {}),
-            "workspace_policy": data.get("workspace_policy", {}),
+            "workspace_policy": self.workspace_profiles(),
+            "filesystem_scope": self.filesystem_policy,
         }
+
+    def workspace_profiles(self) -> dict[str, Any]:
+        data = bridge_workspace_profiles()
+        if not self._restricted() or not isinstance(data, dict):
+            return data
+        visible: list[dict[str, Any]] = []
+        for item in data.get("workspaces", []):
+            if not isinstance(item, dict):
+                continue
+            root = str(item.get("root") or "")
+            try:
+                resolved = self._resolved_scope_path(root)
+            except Exception:
+                continue
+            if filesystem_can_read(self.filesystem_policy, resolved):
+                row = dict(item)
+                permissions = dict(row.get("permissions", {}) or {})
+                if not filesystem_can_write(self.filesystem_policy, resolved):
+                    permissions["modify"] = False
+                    permissions["deploy"] = False
+                row["permissions"] = permissions
+                visible.append(row)
+        result = dict(data)
+        result["workspaces"] = visible
+        return result
 
     def managed_update_status(self) -> dict[str, Any]:
         relative = Path("var/lib/joe-mcp-agent/update-status.json")

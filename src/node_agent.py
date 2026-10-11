@@ -54,8 +54,9 @@ def _metadata(name: str) -> dict[str, Any]:
         "os": platform.platform(),
         "architecture": platform.machine(),
         "agent_version": AGENT_VERSION,
-        "software_version": os.getenv("JOE_VERSION", "0.27.4"),
+        "software_version": os.getenv("JOE_VERSION", "0.28.0"),
         "routing_version": str(PROTOCOL_VERSION),
+        "filesystem_scope_version": "1",
         "remote_tools": len(ALL_REMOTE_TOOLS),
         "update_lifecycle": True,
         "shutdown_lifecycle": True,
@@ -185,6 +186,7 @@ def run() -> None:
                     timeout=POLL_SECONDS + 10,
                 )
                 failures = 0
+                executor.set_filesystem_policy(response.get("filesystem_policy"))
                 job = response.get("job")
                 if not isinstance(job, dict):
                     continue

@@ -10,6 +10,8 @@ from typing import Any
 SOCKET_PATH = Path(os.getenv("JOE_BRIDGE_SOCKET", "/run/joe-mcp/bridge.sock"))
 DEFAULT_TIMEOUT = float(os.getenv("JOE_BRIDGE_TIMEOUT", "2.0"))
 SQLITE_DIAGNOSTIC_TIMEOUT = max(30.0, min(float(os.getenv("JOE_SQLITE_DIAGNOSTIC_TIMEOUT", "330")), 900.0))
+DOCKER_READ_TIMEOUT = 15.0
+DOCKER_ACTION_TIMEOUT = 60.0
 
 
 class BridgeUnavailable(ConnectionError):
@@ -251,19 +253,25 @@ def journal_logs(unit: str, lines: int = 200, since_minutes: int = 0, text: str 
 
 
 def docker_containers(pattern: str = "*", max_results: int = 200) -> dict[str, Any]:
-    return request("docker_containers", pattern=pattern, max_results=max_results)
+    return request("docker_containers", timeout=DOCKER_READ_TIMEOUT, pattern=pattern, max_results=max_results)
 
 
 def docker_container_status(container: str) -> dict[str, Any]:
-    return request("docker_container_status", container=container)
+    return request("docker_container_status", timeout=DOCKER_READ_TIMEOUT, container=container)
 
 
 def docker_action(container: str, action: str) -> dict[str, Any]:
-    return request("docker_action", container=container, action=action)
+    return request("docker_action", timeout=DOCKER_ACTION_TIMEOUT, container=container, action=action)
 
 
 def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dict[str, Any]:
-    return request("docker_logs", container=container, lines=lines, since_minutes=since_minutes)
+    return request(
+        "docker_logs",
+        timeout=DOCKER_READ_TIMEOUT,
+        container=container,
+        lines=lines,
+        since_minutes=since_minutes,
+    )
 
 
 def list_sessions() -> dict[str, Any]:
