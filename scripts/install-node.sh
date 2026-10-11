@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JOE_VERSION="0.28.0"
+JOE_VERSION="0.28.1"
 SERVER=""
 ENROLL=""
 NODE_NAME="$(hostname 2>/dev/null || echo managed-node)"
 NODE_NAME_EXPLICIT=0
 INSTALL_DIR="/opt/joe-node"
+VERBOSE=0
 
 usage() {
   cat <<'EOF'
-Usage: install-node.sh --server https://controller.example.com [--enroll TOKEN] [--name NAME] [--install-dir PATH]
+Usage: install-node.sh --server https://controller.example.com [--enroll TOKEN] [--name NAME] [--install-dir PATH] [--verbose]
 
 Installs the managed Joe Cloud agent and guarded host bridge. The customer node does
 not install the Joe controller, web GUI, MCP endpoint, Git repository, or Docker stack.
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --enroll|--pairing-code) ENROLL="${2:-}"; shift 2 ;;
     --name) NODE_NAME="${2:-}"; NODE_NAME_EXPLICIT=1; shift 2 ;;
     --install-dir) INSTALL_DIR="${2:-}"; shift 2 ;;
+    --verbose) VERBOSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -104,7 +106,8 @@ CHECKSUM="$TMP/joe-node.sha256"
 EXTRACT="$TMP/extract"
 mkdir -p "$EXTRACT"
 
-echo "Downloading versioned Joe Agent package from $SERVER ..."
+echo "Installing Joe Agent..."
+echo "[1/4] Downloading and verifying the secure package..."
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$SERVER/node-bundle.tar.gz" -o "$BUNDLE"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$SERVER/node-bundle.sha256" -o "$CHECKSUM"
 
@@ -192,19 +195,33 @@ if path.is_file():
 PYWORK
 
 cd "$INSTALL_DIR"
-echo "Installing guarded Joe host services ..."
-JOE_MANAGED_NODE=1 ./scripts/install-host-bridge.sh
+echo "[2/4] Installing protected host services..."
+if [[ "$VERBOSE" -eq 1 ]]; then
+  JOE_MANAGED_NODE=1 JOE_INSTALL_VERBOSE=1 ./scripts/install-host-bridge.sh
+else
+  if ! JOE_MANAGED_NODE=1 JOE_INSTALL_VERBOSE=0 ./scripts/install-host-bridge.sh >"$TMP/host-services.log" 2>&1; then
+    echo "Host service installation failed. Diagnostic output:" >&2
+    cat "$TMP/host-services.log" >&2
+    exit 1
+  fi
+fi
 
 if [[ ! -s /var/lib/joe-mcp-agent/config.json ]]; then
-  echo "Enrolling this device with your Joe Cloud account ..."
+  echo "[3/4] Enrolling this device with your Joe account..."
   if [[ -n "$ENROLL" ]]; then
-    python3 "$INSTALL_DIR/src/device_agent_client.py" --enroll-only --server "$SERVER" --name "$NODE_NAME" --pairing-code "$ENROLL"
+    if [[ "$VERBOSE" -eq 1 ]]; then
+      python3 "$INSTALL_DIR/src/device_agent_client.py" --enroll-only --server "$SERVER" --name "$NODE_NAME" --pairing-code "$ENROLL"
+    elif ! python3 "$INSTALL_DIR/src/device_agent_client.py" --enroll-only --server "$SERVER" --name "$NODE_NAME" --pairing-code "$ENROLL" >"$TMP/enroll.log" 2>&1; then
+      echo "Device enrollment failed. Diagnostic output:" >&2
+      cat "$TMP/enroll.log" >&2
+      exit 1
+    fi
   else
     echo "No one-time enrollment token was supplied. Enter the pairing code from Devices -> Add device."
     python3 "$INSTALL_DIR/src/device_agent_client.py" --enroll-only --server "$SERVER" --name "$NODE_NAME"
   fi
 else
-  echo "Existing Joe device credential found; preserving device identity."
+  echo "[3/4] Existing Joe device found. Preserving its identity..."
 fi
 
 install -d -m 0700 /var/lib/joe-mcp-agent
@@ -222,8 +239,13 @@ if systemctl list-unit-files joe-mcp-device-agent.service >/dev/null 2>&1; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now joe-mcp-node-agent.service >/dev/null
+if [[ "$VERBOSE" -eq 1 ]]; then
+  systemctl enable --now joe-mcp-node-agent.service
+else
+  systemctl enable --now joe-mcp-node-agent.service >/dev/null 2>&1
+fi
 
+echo "[4/4] Verifying services and controller connection..."
 for _ in $(seq 1 20); do
   systemctl is-active --quiet joe-mcp-host-bridge.service \
     && systemctl is-active --quiet joe-mcp-session-host.service \
@@ -234,6 +256,16 @@ done
 systemctl is-active --quiet joe-mcp-host-bridge.service || { echo "Joe host bridge failed to start." >&2; exit 1; }
 systemctl is-active --quiet joe-mcp-session-host.service || { echo "Joe persistent-session host failed to start." >&2; exit 1; }
 systemctl is-active --quiet joe-mcp-node-agent.service || { echo "Joe managed agent failed to start." >&2; journalctl -u joe-mcp-node-agent.service -n 30 --no-pager >&2 || true; exit 1; }
+
+CONTROLLER_REACHABLE=0
+for _ in $(seq 1 5); do
+  if curl --fail --silent --show-error --proto '=https' --tlsv1.2 "$SERVER/health" >/dev/null 2>&1; then
+    CONTROLLER_REACHABLE=1
+    break
+  fi
+  sleep 1
+done
+[[ "$CONTROLLER_REACHABLE" -eq 1 ]] || { echo "Joe services started, but the controller health check could not be reached." >&2; exit 1; }
 
 DEVICE_ID="$(python3 - <<'PY' 2>/dev/null || true
 import json
@@ -246,10 +278,15 @@ PY
 )"
 
 echo
-echo "Joe Agent installation complete."
-echo "Device: ${DEVICE_ID:-registered}"
+echo "Joe Agent is ready."
+echo "Device: $NODE_NAME"
 echo "Controller: $SERVER"
 echo "Agent: running"
-echo "The device should now appear Online in Joe Devices."
-echo "No inbound management port was opened. Joe connects outbound over HTTPS."
-echo "This managed node does not contain the Joe Cloud controller, customer web app, or MCP server."
+echo "Connection: controller reachable"
+echo "Status: ready in Joe Devices"
+echo
+echo "Joe connects outbound over HTTPS. No inbound management port was opened."
+if [[ "$VERBOSE" -eq 1 ]]; then
+  echo "Internal device ID: ${DEVICE_ID:-registered}"
+  echo "This managed node contains only the Joe Agent runtime, not the Joe Cloud controller or customer web app."
+fi

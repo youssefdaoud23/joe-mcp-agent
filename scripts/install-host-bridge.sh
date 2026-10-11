@@ -185,14 +185,21 @@ PYMANAGED
 fi
 
 systemctl daemon-reload
-systemctl enable joe-mcp-session-host.service joe-mcp-host-bridge.service >/dev/null
-if systemctl is-active --quiet joe-mcp-session-host.service; then
-  echo "Joe MCP persistent session host already active; preserving existing sessions."
+if [[ "${JOE_INSTALL_VERBOSE:-0}" == "1" ]]; then
+  systemctl enable joe-mcp-session-host.service joe-mcp-host-bridge.service
+  if systemctl is-active --quiet joe-mcp-session-host.service; then
+    echo "Joe MCP persistent session host already active; preserving existing sessions."
+  else
+    systemctl start joe-mcp-session-host.service
+  fi
+  systemctl restart joe-mcp-host-bridge.service
+  echo "Joe MCP host bridge installed and restarted."
+  echo "Persistent session host status: $(systemctl is-active joe-mcp-session-host.service)"
+  systemctl --no-pager --full status joe-mcp-host-bridge.service | sed -n '1,12p'
 else
-  systemctl start joe-mcp-session-host.service
+  systemctl enable joe-mcp-session-host.service joe-mcp-host-bridge.service >/dev/null 2>&1
+  if ! systemctl is-active --quiet joe-mcp-session-host.service; then
+    systemctl start joe-mcp-session-host.service >/dev/null 2>&1
+  fi
+  systemctl restart joe-mcp-host-bridge.service >/dev/null 2>&1
 fi
-systemctl restart joe-mcp-host-bridge.service
-
-echo "Joe MCP host bridge installed and restarted."
-echo "Persistent session host status: $(systemctl is-active joe-mcp-session-host.service)"
-systemctl --no-pager --full status joe-mcp-host-bridge.service | sed -n '1,12p'
