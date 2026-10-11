@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import subprocess
 from typing import Any
@@ -123,24 +124,32 @@ def docker_containers(pattern: str = "*", max_results: int = 200) -> dict[str, A
 def docker_container_status(container: str) -> dict[str, Any]:
     target = normalize_container(container)
     template = (
-        "{{.Id}}\t{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t"
-        "{{.State.Running}}\t{{.State.Pid}}\t{{.RestartCount}}\t"
-        "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t{{.Created}}"
+        "{{.Id}}\t{{.Name}}\t{{.Config.Image}}\t{{json .State}}\t"
+        "{{.RestartCount}}\t{{.Created}}\t{{.HostConfig.RestartPolicy.Name}}"
     )
     output = _run(["inspect", "--type=container", "--format", template, target], max_bytes=64_000).strip()
     parts = output.split("\t")
-    if len(parts) != 9:
+    if len(parts) != 7:
         raise DockerError("docker returned an unexpected container status format")
-    container_id, name, image, state, running, pid, restarts, health, created = parts
+    container_id, name, image, state_json, restarts, created, restart_policy = parts
+    try:
+        state_data = json.loads(state_json)
+    except json.JSONDecodeError as exc:
+        raise DockerError("docker returned invalid container state") from exc
+    if not isinstance(state_data, dict):
+        raise DockerError("docker returned invalid container state")
+    health_data = state_data.get("Health")
+    health = str(health_data.get("Status") or "") if isinstance(health_data, dict) else ""
     return {
         "id": container_id,
         "name": name.lstrip("/"),
         "image": image,
-        "state": state,
-        "running": running.lower() == "true",
-        "pid": _to_int(pid),
+        "state": str(state_data.get("Status") or ""),
+        "running": bool(state_data.get("Running", False)),
+        "pid": _to_int(str(state_data.get("Pid") or "0")),
         "restart_count": _to_int(restarts),
         "health": health or None,
+        "restart_policy": restart_policy or None,
         "created": created or None,
     }
 

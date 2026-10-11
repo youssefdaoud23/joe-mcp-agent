@@ -83,7 +83,7 @@ class NodeExecutor:
     def __init__(self, host_root: Path | None = None) -> None:
         self.host_root = host_root or Path(os.getenv("JOE_HOST_ROOT", "/host"))
         self.node_name = os.getenv("JOE_NODE_NAME", "managed-node")
-        self.version = os.getenv("JOE_VERSION", "0.28.1")
+        self.version = os.getenv("JOE_VERSION", "0.28.2")
         self.mode = os.getenv("JOE_MODE", "guarded")
         self.filesystem_policy = default_filesystem_policy()
         self.searches = SearchManager(self.host_root)

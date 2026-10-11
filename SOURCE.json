@@ -1,10 +1,10 @@
 {
-  "agent_version": "0.28.1",
-  "bundle_sha256": "2c4ad52f91c991cd656dba1436f0f6f96d96fb514e6cbdd26bd1eb601b3c91f6",
+  "agent_version": "0.28.2",
+  "bundle_sha256": "da84b93dfaf66716678f103f3528b5a4b465edf01ea5fc8eace0071e97cea44b",
   "generated": true,
   "managed_runtime_files": 48,
   "name": "joe-mcp-agent",
   "schema_version": 1,
-  "source_commit": "0a5fa2de7c33f9cee9b8140c7a241ae23e0a5f9f",
+  "source_commit": "8cb8b7d1ba571c879169e170b78aee2aba4bc93b",
   "source_private_repository": "joe-mcp-server"
 }
