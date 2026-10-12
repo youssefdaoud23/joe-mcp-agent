@@ -2,8 +2,8 @@
 
 Lightweight managed-node runtime for Joe-MCP-Server.
 
-Version: `0.32.0`  
-Source controller commit: `50881d4f19da07daec5db7044169294bc290d567`
+Version: `0.33.0`  
+Source controller commit: `951cab88f325bdc4476ca2f293527738050b63ed`
 
 This repository contains only the customer-node agent/runtime exported from the private Joe-MCP-Server source tree. It does **not** contain the Joe controller, customer web application, authentication database, tenant administration, MCP server, billing, or platform-admin code.
 

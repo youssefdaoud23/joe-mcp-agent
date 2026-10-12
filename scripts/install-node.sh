@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JOE_VERSION="0.32.0"
+JOE_VERSION="0.33.0"
 SERVER=""
 ENROLL=""
 NODE_NAME="$(hostname 2>/dev/null || echo managed-node)"
@@ -68,6 +68,22 @@ fi
 for cmd in python3 tar tmux; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Required command is still unavailable after package installation: $cmd" >&2; exit 1; }
 done
+
+if ! python3 -c 'import xlrd' >/dev/null 2>&1; then
+  echo "Installing optional legacy Excel (.xls) reader..."
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends python3-xlrd || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3-xlrd || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y python3-xlrd || true
+  fi
+fi
+if ! python3 -c 'import xlrd' >/dev/null 2>&1; then
+  echo "Note: optional legacy .xls reading is unavailable on this node; XLSX/XLSM support is unaffected." >&2
+fi
 
 python3 - "$SERVER" <<'PYURL'
 import sys

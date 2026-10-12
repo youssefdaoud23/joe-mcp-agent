@@ -230,6 +230,8 @@ def edit_xlsx_range(path: str, cell_range: str, values: list[list[Any]]) -> dict
     with zipfile.ZipFile(target, "r") as archive:
         items = {info.filename: archive.read(info.filename) for info in archive.infolist() if not info.is_dir()}
         sheets = _xlsx_sheet_map(archive)
+    is_macro = target.suffix.lower() == ".xlsm"
+    macro_before = items.get("xl/vbaProject.bin") if is_macro else None
     selected = next((item for item in sheets if item[0] == sheet_name), None) if sheet_name else (sheets[0] if sheets else None)
     if selected is None:
         raise ValueError("Requested spreadsheet sheet was not found")
@@ -277,8 +279,10 @@ def edit_xlsx_range(path: str, cell_range: str, values: list[list[Any]]) -> dict
         row_node[:] = sorted(list(row_node), key=lambda cell: _cell_coords(str(cell.attrib.get("r") or "A1"))[1])
     data[:] = sorted(list(data), key=lambda row: int(row.attrib.get("r", "0") or 0))
     items[sheet_path] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if is_macro and macro_before is not None and items.get("xl/vbaProject.bin") != macro_before:
+        raise ValueError("XLSM macro project changed unexpectedly; edit was blocked")
     packed = _zip_bytes(items); _atomic_bytes(target, packed)
-    return {"path": path, "format": "xlsx", "sheet": name, "range": range_only, "cells_updated": updated, "size": target.stat().st_size}
+    return {"path": path, "format": "xlsm" if is_macro else "xlsx", "sheet": name, "range": range_only, "cells_updated": updated, "size": target.stat().st_size, "macros_present": bool(macro_before) if is_macro else False, "macros_preserved": bool(macro_before) if is_macro else False}
 
 
 def _pdf_escape(text: str) -> str:

@@ -199,6 +199,64 @@ def _xlsx_value(cell: ET.Element, shared: list[str]) -> Any:
         return raw
 
 
+def _xls_rows(path: Path, sheet: str, cell_range: str, offset: int, length: int) -> dict[str, Any]:
+    try:
+        import xlrd  # type: ignore
+    except ImportError as exc:
+        raise ValueError("Legacy .xls support is unavailable because the xlrd runtime dependency is missing") from exc
+    try:
+        book = xlrd.open_workbook(filename=str(path), on_demand=True, formatting_info=False)
+    except Exception as exc:
+        raise ValueError(f"Unable to read legacy .xls workbook: {exc}") from exc
+    try:
+        names = list(book.sheet_names())
+        if not names:
+            return {"format": "xls", "legacy": True, "sheets": [], "rows": []}
+        wanted = str(sheet or "").strip()
+        if wanted:
+            if wanted.isdigit():
+                index = int(wanted)
+                if index < 0 or index >= len(names):
+                    raise ValueError("Requested spreadsheet sheet was not found")
+                ws = book.sheet_by_index(index)
+            else:
+                if wanted not in names:
+                    raise ValueError("Requested spreadsheet sheet was not found")
+                ws = book.sheet_by_name(wanted)
+        else:
+            ws = book.sheet_by_index(0)
+        bounds = _range_bounds(cell_range)
+        if bounds:
+            row_start, col_start, row_end, col_end = bounds
+            row_start -= 1; col_start -= 1; row_end -= 1; col_end -= 1
+        else:
+            row_start = max(0, int(offset))
+            row_end = min(max(0, int(ws.nrows) - 1), row_start + max(1, min(int(length), 1000)) - 1)
+            col_start = 0
+            col_end = min(max(0, int(ws.ncols) - 1), 199)
+            if row_end >= row_start and (row_end-row_start+1)*(col_end-col_start+1) > MAX_SHEET_CELLS:
+                row_end = row_start + max(0, MAX_SHEET_CELLS // max(1, col_end-col_start+1) - 1)
+        rows: list[list[Any]] = []
+        if int(ws.nrows) and int(ws.ncols) and row_end >= row_start:
+            for r in range(row_start, min(row_end + 1, int(ws.nrows))):
+                row: list[Any] = []
+                for c in range(col_start, min(col_end + 1, int(ws.ncols))):
+                    value = ws.cell_value(r, c)
+                    row.append(value)
+                rows.append(row)
+        return {
+            "format": "xls", "legacy": True, "sheet": str(ws.name),
+            "sheet_index": names.index(str(ws.name)), "sheets": names,
+            "range": cell_range or f"rows {row_start+1}:{min(row_end+1, int(ws.nrows))}",
+            "rows": rows, "row_count": len(rows),
+            "column_count": max((len(row) for row in rows), default=0),
+        }
+    finally:
+        release = getattr(book, "release_resources", None)
+        if callable(release):
+            release()
+
+
 def _xlsx_rows(path: Path, sheet: str, cell_range: str, offset: int, length: int) -> dict[str, Any]:
     with zipfile.ZipFile(path, "r") as archive:
         sheets = _xlsx_sheet_map(archive)
@@ -344,9 +402,14 @@ def read_rich_file(
     if suffix == ".docx":
         return _docx_xml(target, offset, length) if raw_xml or int(offset) > 0 else _docx_outline(target)
     if suffix in {".xlsx", ".xlsm"}:
-        return _xlsx_rows(target, sheet, cell_range, offset, length)
+        result = _xlsx_rows(target, sheet, cell_range, offset, length)
+        result["format"] = "xlsm" if suffix == ".xlsm" else "xlsx"
+        if suffix == ".xlsm":
+            with zipfile.ZipFile(target, "r") as archive:
+                result["macros_present"] = "xl/vbaProject.bin" in archive.namelist()
+        return result
     if suffix == ".xls":
-        raise ValueError("Legacy .xls binary workbooks are not supported safely; convert to .xlsx first")
+        return _xls_rows(target, sheet, cell_range, offset, length)
     if suffix == ".pdf":
         raw = target.read_bytes()
         text = _pdf_stream_text(raw)
@@ -371,6 +434,19 @@ def rich_file_info(path: str, host_root: Path) -> dict[str, Any]:
     if not target.exists() or not target.is_file():
         return info
     suffix = target.suffix.lower()
+    if suffix == ".xls":
+        try:
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(filename=str(target), on_demand=True, formatting_info=False)
+            try:
+                info["format"] = "xls"
+                info["legacy"] = True
+                info["sheets"] = [{"name": str(book.sheet_by_index(i).name), "rowCount": int(book.sheet_by_index(i).nrows), "colCount": int(book.sheet_by_index(i).ncols)} for i in range(min(int(book.nsheets), 100))]
+            finally:
+                release = getattr(book, "release_resources", None)
+                if callable(release): release()
+        except Exception as exc:
+            info["legacy_xls_error"] = str(exc)[:300]
     if suffix in {".xlsx", ".xlsm"}:
         try:
             with zipfile.ZipFile(target, "r") as archive:
@@ -394,6 +470,9 @@ def rich_file_info(path: str, host_root: Path) -> dict[str, Any]:
                         pass
                     sheet_rows.append({"name": name, "rowCount": row_count, "colCount": col_count})
                 info["sheets"] = sheet_rows
+                info["format"] = "xlsm" if suffix == ".xlsm" else "xlsx"
+                if suffix == ".xlsm":
+                    info["macros_present"] = "xl/vbaProject.bin" in archive.namelist()
         except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError):
             pass
     if (info.get("mime") or "").startswith("text/") or suffix in {".md", ".py", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log", ".sh", ".js", ".ts", ".css", ".html", ".xml", ".csv", ".sql"}:

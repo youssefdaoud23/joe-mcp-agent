@@ -54,7 +54,7 @@ def _metadata(name: str) -> dict[str, Any]:
         "os": platform.platform(),
         "architecture": platform.machine(),
         "agent_version": AGENT_VERSION,
-        "software_version": os.getenv("JOE_VERSION", "0.32.0"),
+        "software_version": os.getenv("JOE_VERSION", "0.33.0"),
         "routing_version": str(PROTOCOL_VERSION),
         "filesystem_scope_version": "1",
         "remote_tools": len(ALL_REMOTE_TOOLS),
