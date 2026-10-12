@@ -613,3 +613,133 @@ def git_rollback_last(path: str, expected_head: str, confirm: bool = False) -> d
         raise GitError("Git HEAD changed since approval; rollback is blocked")
     parent = _run(repo, ["rev-parse", "HEAD^"], max_bytes=4096).strip()
     return git_reset_to_commit(str(repo), parent, current, confirm)
+
+def _local_branch(repo: Path, value: str) -> tuple[str, str]:
+    branch = _branch_name(repo, value)
+    try:
+        commit = _run(repo, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"], max_bytes=4096).strip()
+    except GitError as exc:
+        raise GitError(f"Local Git branch not found: {branch}") from exc
+    return branch, commit
+
+
+def git_compare_branches(path: str, left: str, right: str, max_commits: int = 20) -> dict[str, Any]:
+    repo = resolve_repo(path)
+    left_name, left_commit = _local_branch(repo, left)
+    right_name, right_commit = _local_branch(repo, right)
+    base = _run(repo, ["merge-base", left_commit, right_commit], max_bytes=4096).strip()
+    counts = _run(repo, ["rev-list", "--left-right", "--count", f"{left_commit}...{right_commit}"], max_bytes=4096).strip().split()
+    if len(counts) != 2:
+        raise GitError("Unable to determine branch divergence")
+    count = max(1, min(int(max_commits), 100))
+    def subjects(commit: str, other: str) -> list[dict[str, str]]:
+        out = _run(repo, ["log", f"--max-count={count}", "--pretty=format:%H%x09%s", commit, "--not", other], max_bytes=100_000)
+        rows=[]
+        for line in out.splitlines():
+            parts=line.split("\t",1)
+            if len(parts)==2:
+                rows.append({"commit":parts[0],"subject":parts[1][:500]})
+        return rows
+    raw_names = _run(repo, ["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", left_commit, right_commit, "--"], max_bytes=1_000_000)
+    changed = [item for item in raw_names.split("\x00") if item and item != "[TRUNCATED]"]
+    safe_paths, hidden = _safe_repo_paths(repo, changed)
+    selected = safe_paths[:MAX_DIFF_PATHS]
+    stat_text = _run(repo, ["diff", "--stat", "--no-ext-diff", "--no-textconv", left_commit, right_commit, "--", *selected], max_bytes=100_000) if selected else ""
+    return {
+        "repository": str(repo), "left": left_name, "right": right_name,
+        "left_commit": left_commit, "right_commit": right_commit, "merge_base": base,
+        "left_only_count": int(counts[0]), "right_only_count": int(counts[1]),
+        "left_only": subjects(left_commit, right_commit), "right_only": subjects(right_commit, left_commit),
+        "changed_paths": selected, "restricted_paths_hidden": hidden, "paths_truncated": len(safe_paths) > MAX_DIFF_PATHS,
+        "diff_stat": stat_text,
+    }
+
+
+def git_merge_preview(path: str, destination: str, source: str, max_bytes: int = 200_000) -> dict[str, Any]:
+    repo = resolve_repo(path)
+    destination_name, destination_commit = _local_branch(repo, destination)
+    source_name, source_commit = _local_branch(repo, source)
+    if destination_name == source_name:
+        raise GitError("Source and destination branches must be different")
+    base = _run(repo, ["merge-base", destination_commit, source_commit], max_bytes=4096).strip()
+    limit = max(10_000, min(int(max_bytes), MAX_GIT_OUTPUT_BYTES))
+    output = _run(repo, ["merge-tree", base, destination_commit, source_commit], max_bytes=limit)
+    conflict_markers = sum(output.count(marker) for marker in ("<<<<<<<", ">>>>>>>", "changed in both", "CONFLICT"))
+    return {
+        "repository": str(repo), "destination": destination_name, "source": source_name,
+        "destination_commit": destination_commit, "source_commit": source_commit, "merge_base": base,
+        "conflicts_detected": conflict_markers > 0, "conflict_marker_count": conflict_markers,
+        "preview_bytes": len(output.encode("utf-8", errors="replace")),
+        "preview_truncated": output.endswith("[TRUNCATED]"),
+    }
+
+
+def git_merge_branches(
+    path: str, destination: str, source: str, expected_destination_head: str,
+    message: str = "", confirm: bool = False,
+) -> dict[str, Any]:
+    repo = resolve_repo(path)
+    authorize_git_action(str(repo), "branch_switch")
+    authorize_git_action(str(repo), "commit")
+    if confirm is not True:
+        raise GitError("Git branch merge requires confirm=true")
+    _clean_for_branch_change(repo)
+    destination_name, destination_commit = _local_branch(repo, destination)
+    source_name, source_commit = _local_branch(repo, source)
+    expected = str(expected_destination_head or "").strip().lower()
+    if not COMMIT_RE.fullmatch(expected):
+        raise GitError("expected_destination_head must be a Git commit hash")
+    expected_full = _run(repo, ["rev-parse", "--verify", f"{expected}^{{commit}}"], max_bytes=4096).strip()
+    if expected_full != destination_commit:
+        raise GitError("Destination branch changed; refresh comparison before merging")
+    if destination_name == source_name:
+        raise GitError("Source and destination branches must be different")
+    preview = git_merge_preview(str(repo), destination_name, source_name, 100_000)
+    if preview["conflicts_detected"]:
+        raise GitError("Merge preview detected conflicts; merge was not attempted")
+    subject = _commit_message(message or f"Merge {source_name} into {destination_name}")
+    stamp = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y%m%d%H%M%S")
+    backup = f"backup/joe-pre-merge-{destination_name.replace('/', '-')}-{stamp}"
+    _run(repo, ["branch", "--no-track", backup, destination_commit], timeout=10.0, max_bytes=16_000)
+    current = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
+    temp_dir: Path | None = None
+    try:
+        if current == destination_name:
+            try:
+                _run(repo, ["merge", "--no-ff", "--no-commit", source_commit], timeout=60.0, max_bytes=100_000)
+                _run(repo, ["-c", "commit.gpgSign=false", "commit", "--no-gpg-sign", "-m", subject], timeout=30.0, max_bytes=50_000)
+            except Exception:
+                try:
+                    _run(repo, ["merge", "--abort"], timeout=15.0, max_bytes=16_000)
+                except Exception:
+                    pass
+                raise
+            merged = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+        else:
+            import tempfile
+            temp_parent = Path(tempfile.mkdtemp(prefix="joe-git-merge-"))
+            temp_dir = temp_parent / "worktree"
+            _run(repo, ["worktree", "add", "--detach", str(temp_dir), destination_commit], timeout=30.0, max_bytes=50_000)
+            try:
+                _run(temp_dir, ["merge", "--no-ff", "--no-commit", source_commit], timeout=60.0, max_bytes=100_000)
+                _run(temp_dir, ["-c", "commit.gpgSign=false", "commit", "--no-gpg-sign", "-m", subject], timeout=30.0, max_bytes=50_000)
+                merged = _run(temp_dir, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+                _run(repo, ["update-ref", f"refs/heads/{destination_name}", merged, destination_commit], timeout=10.0, max_bytes=16_000)
+            finally:
+                try:
+                    _run(repo, ["worktree", "remove", "--force", str(temp_dir)], timeout=30.0, max_bytes=50_000)
+                except Exception:
+                    pass
+        return {
+            "repository": str(repo), "destination": destination_name, "source": source_name,
+            "before": destination_commit, "source_commit": source_commit, "after": merged,
+            "backup_branch": backup, "merge_commit_created": True, "used_temporary_worktree": current != destination_name,
+        }
+    finally:
+        if temp_dir is not None:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir.parent, ignore_errors=True)
+            except Exception:
+                pass
+

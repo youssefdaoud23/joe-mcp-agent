@@ -17,7 +17,10 @@ from src.bridge_client import (
     edit_file as bridge_edit_file,
     edit_spreadsheet_range as bridge_edit_spreadsheet_range,
     git_commit as bridge_git_commit,
+    git_compare_branches as bridge_git_compare_branches,
     git_diff as bridge_git_diff,
+    git_merge_branches as bridge_git_merge_branches,
+    git_merge_preview as bridge_git_merge_preview,
     git_log as bridge_git_log,
     git_branches as bridge_git_branches,
     git_branch_create as bridge_git_branch_create,
@@ -27,10 +30,19 @@ from src.bridge_client import (
     git_status as bridge_git_status,
     interact_with_process as bridge_interact_with_process,
     journal_logs as bridge_journal_logs,
+    journal_diagnostics as bridge_journal_diagnostics,
+    kernel_diagnostics as bridge_kernel_diagnostics,
+    firewall_status as bridge_firewall_status,
+    tailscale_status as bridge_tailscale_status,
+    sysctl_read as bridge_sysctl_read,
+    proc_snapshot as bridge_proc_snapshot,
+    routing_diagnostics as bridge_routing_diagnostics,
+    systemd_failed_units as bridge_systemd_failed_units,
     list_timers as bridge_list_timers,
     timer_status as bridge_timer_status,
     unit_file as bridge_unit_file,
     kill_process as bridge_kill_process,
+    terminate_host_process as bridge_terminate_host_process,
     list_services as bridge_list_services,
     list_sessions as bridge_list_sessions,
     workspace_profiles as bridge_workspace_profiles,
@@ -46,11 +58,14 @@ from src.bridge_client import (
     purge_trash as bridge_purge_trash,
     read_process_output as bridge_read_process_output,
     service_action as bridge_service_action,
+    unit_action as bridge_unit_action,
     service_status as bridge_service_status,
     start_process as bridge_start_process,
     start_workspace_node_check as bridge_start_workspace_node_check,
     start_workspace_python as bridge_start_workspace_python,
     start_workspace_python_code as bridge_start_workspace_python_code,
+    start_workspace_shell as bridge_start_workspace_shell,
+    start_managed_terminal as bridge_start_managed_terminal,
     start_workspace_pytest as bridge_start_workspace_pytest,
     write_file as bridge_write_file,
     write_pdf as bridge_write_pdf,
@@ -65,9 +80,10 @@ from src.filesystem_scope import (
     default_filesystem_policy,
     normalize_filesystem_policy,
 )
+from src.managed_terminal import discover_scope_protections, profiles_info as managed_terminal_profiles_info
 from src.rich_file import read_multiple_rich_files, read_rich_file, rich_file_info
-from src.url_read import read_url
-from src.process_ops import list_open_ports as inspect_open_ports, list_processes as inspect_processes, process_info as inspect_process_info
+from src.url_read import http_probe as safe_http_probe, read_url
+from src.process_ops import list_open_ports as inspect_open_ports, list_processes as inspect_processes, process_info as inspect_process_info, process_memory_info as inspect_process_memory_info
 from src.read_tools import read_multiple_text_files, read_text_page
 from src.remote_protocol import ALL_REMOTE_TOOLS, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES
 from src.search_sessions import SearchManager
@@ -83,7 +99,7 @@ class NodeExecutor:
     def __init__(self, host_root: Path | None = None) -> None:
         self.host_root = host_root or Path(os.getenv("JOE_HOST_ROOT", "/host"))
         self.node_name = os.getenv("JOE_NODE_NAME", "managed-node")
-        self.version = os.getenv("JOE_VERSION", "0.28.2")
+        self.version = os.getenv("JOE_VERSION", "0.32.0")
         self.mode = os.getenv("JOE_MODE", "guarded")
         self.filesystem_policy = default_filesystem_policy()
         self.searches = SearchManager(self.host_root)
@@ -102,8 +118,10 @@ class NodeExecutor:
             "get_file_info": self.get_file_info,
             "file_inspect": self.file_inspect,
             "read_url": self.read_url,
+            "http_probe": self.http_probe,
             "list_processes": self.list_processes,
             "process_info": self.process_info,
+            "process_memory_info": self.process_memory_info,
             "list_open_ports": self.list_open_ports,
             "search_files": self.search_files,
             "search_content": self.search_content,
@@ -115,8 +133,11 @@ class NodeExecutor:
             "git_diff": bridge_git_diff,
             "git_log": bridge_git_log,
             "git_branches": bridge_git_branches,
+            "git_compare_branches": bridge_git_compare_branches,
+            "git_merge_preview": bridge_git_merge_preview,
             "git_branch_create": bridge_git_branch_create,
             "git_branch_switch": bridge_git_branch_switch,
+            "git_merge_branches": bridge_git_merge_branches,
             "git_restore_to_commit": bridge_git_restore_to_commit,
             "git_restore_previous": bridge_git_restore_previous,
             "git_stage": bridge_git_stage,
@@ -127,8 +148,17 @@ class NodeExecutor:
             "timer_status": bridge_timer_status,
             "unit_file": bridge_unit_file,
             "service_status": bridge_service_status,
+            "systemd_failed_units": bridge_systemd_failed_units,
             "service_action": bridge_service_action,
+            "unit_action": bridge_unit_action,
             "journal_logs": bridge_journal_logs,
+            "journal_diagnostics": bridge_journal_diagnostics,
+            "kernel_diagnostics": bridge_kernel_diagnostics,
+            "firewall_status": bridge_firewall_status,
+            "tailscale_status": bridge_tailscale_status,
+            "sysctl_read": bridge_sysctl_read,
+            "proc_snapshot": bridge_proc_snapshot,
+            "routing_diagnostics": bridge_routing_diagnostics,
             "docker_containers": bridge_docker_containers,
             "docker_container_status": bridge_docker_container_status,
             "docker_action": bridge_docker_action,
@@ -136,11 +166,14 @@ class NodeExecutor:
             "start_process": bridge_start_process,
             "start_workspace_python": bridge_start_workspace_python,
             "start_workspace_python_code": bridge_start_workspace_python_code,
+            "start_workspace_shell": bridge_start_workspace_shell,
+            "start_managed_terminal": self.start_managed_terminal,
             "start_workspace_node_check": bridge_start_workspace_node_check,
             "start_workspace_pytest": bridge_start_workspace_pytest,
             "read_process_output": bridge_read_process_output,
             "interact_with_process": bridge_interact_with_process,
             "kill_process": bridge_kill_process,
+            "terminate_host_process": bridge_terminate_host_process,
             "write_file": bridge_write_file,
             "write_pdf": self.write_pdf,
             "edit_file": bridge_edit_file,
@@ -215,6 +248,75 @@ class NodeExecutor:
         self._require_path(root, write=write)
         return root
 
+    def _terminal_write_roots(self) -> list[str]:
+        if self._restricted():
+            return []
+        candidates: list[str] = []
+        try:
+            data = bridge_ping()
+        except Exception:
+            data = {}
+        write_policy = data.get("write_policy", {}) if isinstance(data, dict) else {}
+        if isinstance(write_policy, dict):
+            for key in ("roots", "workspace_mutation_roots"):
+                values = write_policy.get(key, [])
+                if isinstance(values, list):
+                    candidates.extend(str(value) for value in values if isinstance(value, str))
+        roots: list[str] = []
+        seen: set[str] = set()
+        for raw in candidates:
+            try:
+                normalized = self._resolved_scope_path(raw)
+                if normalized == "/" or normalized in seen or any(ch.isspace() for ch in normalized):
+                    continue
+                target = safe_host_path(normalized, self.host_root)
+                if not target.exists() or not target.is_dir():
+                    continue
+                if self._restricted() and not filesystem_can_write(self.filesystem_policy, normalized):
+                    continue
+            except Exception:
+                continue
+            roots.append(normalized)
+            seen.add(normalized)
+        return roots[:8]
+
+    def start_managed_terminal(
+        self,
+        profile: str,
+        command: str,
+        cwd: str = "/opt",
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if self._restricted():
+            raise NodeExecutionError("Managed terminal is disabled while device filesystem scope is restricted")
+        if confirm is not True:
+            raise NodeExecutionError("Managed terminal execution requires confirm=true")
+        working_directory = self._require_path(str(cwd or "/opt"), write=False)
+        if working_directory == "/":
+            raise NodeExecutionError("Managed terminal requires an explicit non-root working directory")
+        target = safe_host_path(working_directory, self.host_root)
+        if not target.exists() or not target.is_dir():
+            raise NodeExecutionError("Managed terminal working directory must be an existing directory")
+        mode = str(profile or "inspect").strip().lower()
+        write_roots: list[str] = []
+        if mode == "scoped-write":
+            for root in self._terminal_write_roots():
+                if working_directory == root or working_directory.startswith(root.rstrip("/") + "/"):
+                    write_roots = [working_directory]
+                    break
+                if root.startswith(working_directory.rstrip("/") + "/"):
+                    write_roots.append(root)
+        protections = discover_scope_protections(working_directory, self.host_root)
+        return bridge_start_managed_terminal(
+            mode,
+            command,
+            working_directory,
+            write_roots,
+            list(protections.get("hidden_paths", [])),
+            list(protections.get("read_only_paths", [])),
+            True,
+        )
+
     def _enforce_filesystem_scope(self, tool: str, arguments: dict[str, Any]) -> None:
         if not self._restricted():
             return
@@ -234,22 +336,25 @@ class NodeExecutor:
             "sqlite_tables", "sqlite_schema", "sqlite_query", "sqlite_table_stats", "localhost_http",
             "deployment_preflight", "deployment_verify",
         }
-        workspace_write_tools = {
-            "start_workspace_python", "start_workspace_python_code", "start_workspace_pytest",
-            "deployment_restore_previous",
+        workspace_write_tools = {"deployment_restore_previous"}
+        restricted_code_tools = {
+            "start_workspace_python", "start_workspace_python_code", "start_workspace_shell", "start_workspace_pytest",
+            "start_managed_terminal",
         }
         restricted_session_tools = {
-            "start_process", "read_process_output", "interact_with_process", "kill_process", "force_terminate",
+            "start_process", "read_process_output", "interact_with_process", "kill_process", "force_terminate", "terminate_host_process",
             "list_sessions", "list_processes", "process_info", "list_open_ports",
         }
         restricted_global_tools = {
-            "list_services", "service_status", "service_action", "list_timers", "timer_status", "unit_file", "journal_logs",
+            "list_services", "service_status", "systemd_failed_units", "service_action", "unit_action", "list_timers", "timer_status", "unit_file", "journal_logs", "journal_diagnostics", "kernel_diagnostics", "firewall_status", "tailscale_status", "sysctl_read", "proc_snapshot", "routing_diagnostics",
             "docker_containers", "docker_container_status", "docker_action", "docker_logs",
         }
         safe_nonfilesystem_tools = {
-            "server_info", "node_policy", "get_config", "managed_update_status", "host_info", "read_url",
+            "server_info", "node_policy", "get_config", "managed_update_status", "host_info", "read_url", "http_probe",
             "get_search_results", "list_searches", "stop_search", "workspace_profiles",
         }
+        if tool in restricted_code_tools:
+            raise NodeExecutionError("Arbitrary code and terminal execution are disabled while device filesystem scope is restricted")
         if tool in restricted_session_tools:
             raise NodeExecutionError("Process and session tools are disabled while device filesystem scope is restricted")
         if tool in restricted_global_tools:
@@ -348,6 +453,15 @@ class NodeExecutor:
             "remote_agent": True,
         }
 
+    def _managed_terminal_policy(self) -> dict[str, Any]:
+        info = managed_terminal_profiles_info(self._terminal_write_roots())
+        if self._restricted():
+            info["reason"] = "disabled while device filesystem scope is restricted"
+            for profile in info.get("profiles", []):
+                if isinstance(profile, dict):
+                    profile["enabled"] = False
+        return info
+
     def node_policy(self) -> dict[str, Any]:
         data = bridge_ping()
         write_policy = dict(data.get("write_policy", {}) or {})
@@ -364,6 +478,7 @@ class NodeExecutor:
             "allowed_commands": data.get("allowed_commands", []),
             "persistent_sessions": data.get("persistent_sessions", {}),
             "workspace_policy": self.workspace_profiles(),
+            "managed_terminal": self._managed_terminal_policy(),
             "filesystem_scope": self.filesystem_policy,
         }
 
@@ -539,6 +654,9 @@ class NodeExecutor:
     def read_url(self, url: str, timeout_seconds: float = 10.0, max_bytes: int = 1_000_000) -> dict[str, Any]:
         return read_url(url, timeout_seconds, max_bytes)
 
+    def http_probe(self, url: str, method: str = "HEAD", timeout_seconds: float = 10.0, max_bytes: int = 32768) -> dict[str, Any]:
+        return safe_http_probe(url, method, timeout_seconds, max_bytes)
+
     def write_pdf(self, path: str, content: Any, outputPath: str = "", options: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(content, str):
             raise ValueError("Existing-PDF insert/delete/sourcePdf operations are not supported yet")
@@ -570,6 +688,9 @@ class NodeExecutor:
 
     def process_info(self, pid: int) -> dict[str, Any]:
         return inspect_process_info(self.host_root, pid)
+
+    def process_memory_info(self, pid: int) -> dict[str, Any]:
+        return inspect_process_memory_info(self.host_root, pid)
 
     def list_open_ports(self, max_results: int = 500) -> dict[str, Any]:
         return inspect_open_ports(self.host_root, max_results)

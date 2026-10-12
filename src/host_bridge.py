@@ -14,14 +14,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.action_policy import ActionDenied, action_policy_info, update_action_capabilities, update_action_policy
+from src.action_policy import ActionDenied, action_policy_info, update_action_capabilities, update_action_policy, update_systemd_unit_policy
 from src.command_policy import CommandDenied, allowed_commands, validate_command
-from src.docker_ops import DockerError, docker_action, docker_container_status, docker_containers, docker_logs
+from src.docker_ops import DockerError, docker_action, docker_container_status, docker_containers, docker_logs, recover_joe_tunnel
 from src.file_ops import copy_file, create_directory, edit_file, list_trash, move_file, purge_trash, restore_trash, trash_path, write_file
 from src.rich_write import create_pdf, edit_xlsx_range
-from src.git_ops import (GitError, git_branch_create, git_branch_switch, git_branches, git_commit, git_credentials_info, git_diff, git_log, git_push, git_reset_to_commit, git_rollback_last, git_stage, git_status)
+from src.git_ops import (GitError, git_branch_create, git_branch_switch, git_branches, git_commit, git_compare_branches, git_credentials_info, git_diff, git_log, git_merge_branches, git_merge_preview, git_push, git_reset_to_commit, git_rollback_last, git_stage, git_status)
 from src.http_ops import LocalHTTPError, localhost_http
-from src.journal_ops import JournalError, journal_logs
+from src.journal_ops import JournalError, journal_diagnostics, journal_logs, kernel_diagnostics
+from src.managed_terminal import ManagedTerminalDenied, build_managed_terminal_spec
+from src.linux_diagnostics import LinuxDiagnosticError, firewall_status, proc_snapshot, routing_diagnostics, sysctl_read, tailscale_status
+from src.process_ops import ProcessControlDenied, terminate_host_process
 from src.persistent_sessions import (
     PersistentSessionError,
     backend_info as persistent_backend_info,
@@ -34,10 +37,10 @@ from src.persistent_sessions import (
 )
 from src.security import redact_argv
 from src.sqlite_ops import SQLiteReadError, sqlite_query, sqlite_schema, sqlite_table_stats, sqlite_tables
-from src.systemd_ops import SystemdError, list_services, list_timers, service_action, service_status, timer_status, unit_file
-from src.workspace_exec import build_node_check_command, build_pytest_command, build_python_code_command, build_python_command
-from src.workspace_policy import WorkspaceDenied, update_workspace_capabilities, workspace_profiles
-from src.write_policy import PROJECT_ROOT, WriteDenied, writable_policy_info
+from src.systemd_ops import SystemdError, failed_units, list_services, list_timers, service_action, service_status, timer_status, unit_action, unit_file
+from src.workspace_exec import build_node_check_command, build_pytest_command, build_python_code_command, build_python_command, build_shell_command
+from src.workspace_policy import WorkspaceDenied, set_workspace_http_ports, update_workspace_capabilities, workspace_profiles
+from src.write_policy import PROJECT_ROOT, WriteDenied, safe_write_path, writable_policy_info
 
 SOCKET_PATH = Path(os.getenv("JOE_BRIDGE_SOCKET", "/run/joe-mcp/bridge.sock"))
 MAX_OUTPUT_BYTES = int(os.getenv("JOE_BRIDGE_MAX_OUTPUT_BYTES", "1048576"))
@@ -183,8 +186,12 @@ def _workspace_systemd_command(spec: dict[str, Any], unit: str) -> list[str]:
     if any(ch.isspace() for ch in root) or any(ch in root for ch in "\x00\r\n"):
         raise WorkspaceDenied("Workspace roots with whitespace/control characters are not supported for sandboxed execution")
     inaccessible = [
-        "-/etc/shadow", "-/etc/gshadow", "-/etc/ssl/private",
-        "-/var/lib/joe-mcp-work/.secrets", "-/var/lib/joe-mcp-agent",
+        "-/etc/shadow", "-/etc/gshadow", "-/etc/ssl/private", "-/etc/ssh", "-/etc/sudoers", "-/etc/sudoers.d",
+        "-/etc/polkit-1", "-/etc/NetworkManager/system-connections", "-/etc/netplan", "-/etc/letsencrypt", "-/etc/cloud",
+        "-/etc/apt/auth.conf", "-/etc/apt/auth.conf.d", "-/etc/crypttab", "-/etc/systemd",
+        "-/run/systemd/private", "-/run/dbus/system_bus_socket", "-/run/docker.sock", "-/var/run/docker.sock",
+        "-/run/containerd/containerd.sock", "-/run/joe-mcp/bridge.sock", "-/run/joe-mcp-session/tmux.sock",
+        "-/var/lib/docker", "-/var/lib/containerd", "-/var/lib/joe-mcp-work", "-/var/lib/joe-mcp-agent", "-/var/log", "-/var/backups", "-/var/spool",
         f"-{PROJECT_ROOT}/.secrets", f"-{PROJECT_ROOT}/data/auth",
         f"-{PROJECT_ROOT}/data/audit", f"-{PROJECT_ROOT}/data/devices", f"-{PROJECT_ROOT}/data/sessions",
         f"-{root}/.secrets", f"-{root}/.env", f"-{root}/.git/config",
@@ -209,6 +216,8 @@ def _workspace_systemd_command(spec: dict[str, Any], unit: str) -> list[str]:
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "SystemCallArchitectures=native",
+        "SystemCallFilter=~kill tkill tgkill pidfd_send_signal ptrace process_vm_readv process_vm_writev reboot kexec_load kexec_file_load init_module finit_module delete_module mount umount2 pivot_root swapon swapoff keyctl add_key request_key",
+        "SystemCallErrorNumber=EPERM",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
         "ProtectKernelTunables=yes",
         "ProtectKernelModules=yes",
@@ -237,6 +246,7 @@ def _workspace_systemd_command(spec: dict[str, Any], unit: str) -> list[str]:
         "/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
         f"--unit={unit}", f"--working-directory={root}",
         "--setenv=HOME=/", "--setenv=LANG=C.UTF-8", "--setenv=LC_ALL=C.UTF-8",
+        "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "--setenv=PYTHONUNBUFFERED=1", "--",
     ]
     property_args: list[str] = []
@@ -245,11 +255,160 @@ def _workspace_systemd_command(spec: dict[str, Any], unit: str) -> list[str]:
     return argv[:-1] + property_args + ["--", *list(spec["argv"])]
 
 
+def _managed_terminal_systemd_command(spec: dict[str, Any], unit: str) -> list[str]:
+    cwd = str(spec["cwd"])
+    write_roots = [str(item) for item in spec.get("write_roots", [])]
+    hidden_paths = [str(item) for item in spec.get("hidden_paths", [])]
+    read_only_paths = [str(item) for item in spec.get("read_only_paths", [])]
+    runtime_paths = [
+        "-/usr", "-/bin", "-/sbin", "-/lib", "-/lib64", "-/etc/alternatives",
+        "-/etc/ld.so.cache", "-/etc/passwd", "-/etc/group", "-/etc/nsswitch.conf", "-/etc/localtime",
+    ]
+    properties = [
+        "TemporaryFileSystem=/:ro",
+        "BindReadOnlyPaths=" + " ".join([*runtime_paths, cwd]),
+        *(["BindPaths=" + " ".join(write_roots)] if write_roots else []),
+        *(["ReadOnlyPaths=" + " ".join(read_only_paths)] if read_only_paths else []),
+        *(["InaccessiblePaths=" + " ".join(hidden_paths)] if hidden_paths else []),
+        "PrivateTmp=yes",
+        "PrivateDevices=yes",
+        "PrivateNetwork=yes",
+        "MountAPIVFS=yes",
+        "NoNewPrivileges=yes",
+        "CapabilityBoundingSet=",
+        "AmbientCapabilities=",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=~kill tkill tgkill pidfd_send_signal ptrace process_vm_readv process_vm_writev reboot kexec_load kexec_file_load init_module finit_module delete_module mount umount2 pivot_root swapon swapoff keyctl add_key request_key",
+        "SystemCallErrorNumber=EPERM",
+        "RestrictAddressFamilies=AF_UNIX",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectControlGroups=yes",
+        "ProtectClock=yes",
+        "ProtectHostname=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "RestrictNamespaces=yes",
+        "ProtectProc=invisible",
+        "ProcSubset=pid",
+        "UMask=0077",
+        f"RuntimeMaxSec={int(spec['max_runtime_seconds'])}s",
+        "MemoryMax=2G",
+        "TasksMax=256",
+        "LimitNOFILE=256",
+        "LimitFSIZE=100M",
+    ]
+    argv = [
+        "/usr/bin/systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+        f"--unit={unit}", f"--working-directory={cwd}",
+        "--setenv=HOME=/tmp", "--setenv=LANG=C.UTF-8", "--setenv=LC_ALL=C.UTF-8",
+        "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv=PYTHONUNBUFFERED=1", "--",
+    ]
+    property_args: list[str] = []
+    for item in properties:
+        property_args.extend(["--property", item])
+    return argv[:-1] + property_args + ["--", *list(spec["argv"])]
+
+
+def _start_managed_terminal(
+    profile: str,
+    command: str,
+    cwd: str,
+    write_roots: list[str] | None = None,
+    hidden_paths: list[str] | None = None,
+    read_only_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    if NODE_ROLE != "managed":
+        raise ManagedTerminalDenied("Managed terminal is available only on enrolled managed nodes")
+    if not Path(cwd).is_dir():
+        raise ManagedTerminalDenied("Managed terminal working directory must be an existing directory")
+    validated_write_roots: list[str] = []
+    for raw in write_roots or []:
+        try:
+            candidate = safe_write_path(str(raw), must_exist=True)
+        except (WriteDenied, OSError, ValueError) as exc:
+            raise ManagedTerminalDenied(str(exc)) from exc
+        if not candidate.is_dir():
+            raise ManagedTerminalDenied("Managed terminal write roots must be existing directories")
+        normalized = str(candidate)
+        if normalized != cwd and not normalized.startswith(cwd.rstrip("/") + "/"):
+            raise ManagedTerminalDenied("Managed terminal write roots must stay inside the selected working directory")
+        validated_write_roots.append(normalized)
+
+    def scoped_paths(values: list[str] | None, label: str) -> list[str]:
+        if values is None:
+            return []
+        if not isinstance(values, list) or len(values) > 512:
+            raise ManagedTerminalDenied(f"Managed terminal {label} paths exceed the bounded limit")
+        result: list[str] = []
+        for raw in values:
+            value = str(raw or "")
+            if not value.startswith("/") or any(ch.isspace() for ch in value) or any(ch in value for ch in "\x00\r\n"):
+                raise ManagedTerminalDenied(f"Managed terminal {label} path is invalid")
+            if value != cwd and not value.startswith(cwd.rstrip("/") + "/"):
+                raise ManagedTerminalDenied(f"Managed terminal {label} paths must stay inside the selected working directory")
+            result.append(value)
+        return result
+
+    spec = build_managed_terminal_spec(profile, command, cwd, validated_write_roots)
+    spec["hidden_paths"] = scoped_paths(hidden_paths, "hidden")
+    spec["read_only_paths"] = scoped_paths(read_only_paths, "read-only")
+    _reserve_session_slot()
+    session_id = uuid.uuid4().hex
+    unit = f"joe-mcp-terminal-{session_id[:20]}.service"
+    sandbox_argv = _managed_terminal_systemd_command(spec, unit)
+    process = subprocess.Popen(
+        sandbox_argv,
+        cwd="/",
+        env=SAFE_ENV,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        start_new_session=True,
+    )
+    if process.stdin is not None:
+        try:
+            process.stdin.write(str(spec["stdin_payload"]))
+            if not str(spec["stdin_payload"]).endswith("\n"):
+                process.stdin.write("\n")
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+    runtime = int(spec["max_runtime_seconds"])
+    session = Session(
+        id=session_id,
+        command=str(spec["display"]),
+        argv=list(spec["argv"]),
+        cwd=str(spec["cwd"]),
+        process=process,
+        started_at=time.time(),
+        max_runtime_seconds=runtime,
+        systemd_unit=unit,
+    )
+    with SESSIONS_LOCK:
+        SESSIONS[session.id] = session
+    threading.Thread(target=_reader, args=(session,), daemon=True).start()
+    result = _session_summary(session)
+    result["execution_type"] = "managed_terminal"
+    result["terminal_profile"] = str(spec["profile"])
+    result["network"] = "isolated"
+    result["write_roots"] = list(spec.get("write_roots", []))
+    return result
+
+
 def _start_workspace_process(
     kind: str,
     workspace: str,
     script: str = "",
     code: str = "",
+    command: str = "",
     targets: list[str] | None = None,
     args: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -257,6 +416,8 @@ def _start_workspace_process(
         spec = build_python_command(workspace, script, args)
     elif kind == "python_code":
         spec = build_python_code_command(workspace, code, args)
+    elif kind == "shell":
+        spec = build_shell_command(workspace, command)
     elif kind == "pytest":
         spec = build_pytest_command(workspace, targets, args)
     elif kind == "node_check":
@@ -267,11 +428,12 @@ def _start_workspace_process(
     session_id = uuid.uuid4().hex
     unit = f"joe-mcp-workspace-{session_id[:20]}.service"
     sandbox_argv = _workspace_systemd_command(spec, unit)
+    stdin_payload = spec.get("stdin_payload")
     process = subprocess.Popen(
         sandbox_argv,
         cwd="/",
         env=SAFE_ENV,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -280,6 +442,14 @@ def _start_workspace_process(
         bufsize=1,
         start_new_session=True,
     )
+    if stdin_payload is not None and process.stdin is not None:
+        try:
+            process.stdin.write(str(stdin_payload))
+            if not str(stdin_payload).endswith("\n"):
+                process.stdin.write("\n")
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
     runtime = int(spec["max_runtime_seconds"])
     session = Session(
         id=session_id,
@@ -477,7 +647,7 @@ def _interact(session_id: str, input_text: str, append_newline: bool) -> dict[st
 
 
 def _terminate_owned_session(session: Session, force: bool) -> None:
-    if session.systemd_unit and session.systemd_unit.startswith("joe-mcp-workspace-"):
+    if session.systemd_unit and session.systemd_unit.startswith(("joe-mcp-workspace-", "joe-mcp-terminal-")):
         signal_name = "KILL" if force else "TERM"
         subprocess.run(
             ["systemctl", "kill", "--kill-whom=all", f"--signal={signal_name}", session.systemd_unit],
@@ -586,6 +756,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
         }
     if op == "workspace_profiles":
         return {"ok": True, "result": workspace_profiles()}
+    if op == "set_workspace_http_ports":
+        return {"ok": True, "result": set_workspace_http_ports(str(request.get("workspace", "")), request.get("ports", []), bool(request.get("confirm", False)))}
     if op == "update_workspace_capabilities":
         return {
             "ok": True,
@@ -696,6 +868,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 bool(request.get("confirm_push", False)),
             ),
         }
+    if op == "update_systemd_unit_policy":
+        return {"ok": True, "result": update_systemd_unit_policy(request.get("allowed_units", []), request.get("allowed_actions", []), request.get("enabled"), bool(request.get("confirm", False)))}
     if op == "update_action_policy":
         return {
             "ok": True,
@@ -722,6 +896,26 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
         result = _start_workspace_process(
             "python_code", str(request.get("workspace", "")),
             code=str(request.get("code", "")), args=request.get("args", []),
+        )
+        return {"ok": True, "result": result}
+    if op == "start_workspace_shell":
+        if request.get("confirm") is not True:
+            raise WorkspaceDenied("Sandboxed workspace shell execution requires confirm=true")
+        result = _start_workspace_process(
+            "shell", str(request.get("workspace", "")),
+            command=str(request.get("command", "")),
+        )
+        return {"ok": True, "result": result}
+    if op == "start_managed_terminal":
+        if request.get("confirm") is not True:
+            raise ManagedTerminalDenied("Managed terminal execution requires confirm=true")
+        result = _start_managed_terminal(
+            str(request.get("profile", "inspect")),
+            str(request.get("command", "")),
+            str(request.get("cwd", "/opt")),
+            request.get("write_roots", []),
+            request.get("hidden_paths", []),
+            request.get("read_only_paths", []),
         )
         return {"ok": True, "result": result}
     if op == "start_workspace_pytest":
@@ -753,6 +947,18 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
     if op == "kill_process":
         result = _kill_process(
             str(request.get("session_id", "")),
+            bool(request.get("force", False)),
+        )
+        return {"ok": True, "result": result}
+    if op == "terminate_host_process":
+        if NODE_ROLE != "managed":
+            raise ProcessControlDenied("Host process termination is available only on enrolled managed nodes")
+        if request.get("confirm") is not True:
+            raise ProcessControlDenied("Host process termination requires confirm=true")
+        result = terminate_host_process(
+            Path("/"),
+            int(request.get("pid", 0)),
+            int(request.get("expected_start_ticks", 0)),
             bool(request.get("force", False)),
         )
         return {"ok": True, "result": result}
@@ -821,6 +1027,12 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 int(request.get("max_count", 20)),
             ),
         }
+    if op == "git_compare_branches":
+        return {"ok": True, "result": git_compare_branches(str(request.get("path", "")), str(request.get("left", "")), str(request.get("right", "")), int(request.get("max_commits", 20)))}
+    if op == "git_merge_preview":
+        return {"ok": True, "result": git_merge_preview(str(request.get("path", "")), str(request.get("destination", "")), str(request.get("source", "")), int(request.get("max_bytes", 200000)))}
+    if op == "git_merge_branches":
+        return {"ok": True, "result": git_merge_branches(str(request.get("path", "")), str(request.get("destination", "")), str(request.get("source", "")), str(request.get("expected_destination_head", "")), str(request.get("message", "")), bool(request.get("confirm", False)))}
     if op == "git_branches":
         return {"ok": True, "result": git_branches(str(request.get("path", "")), int(request.get("max_count", 200)))}
     if op == "git_branch_create":
@@ -864,6 +1076,8 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 int(request.get("max_results", 200)),
             ),
         }
+    if op == "systemd_failed_units":
+        return {"ok": True, "result": failed_units(int(request.get("max_results", 200)))}
     if op == "list_timers":
         return {"ok": True, "result": list_timers(str(request.get("pattern", "*")), int(request.get("max_results", 200)))}
     if op == "timer_status":
@@ -883,6 +1097,15 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 str(request.get("action", "")),
             ),
         }
+    if op == "unit_action":
+        return {
+            "ok": True,
+            "result": unit_action(
+                str(request.get("unit", "")),
+                str(request.get("action", "")),
+                request.get("confirm") is True,
+            ),
+        }
     if op == "journal_logs":
         return {
             "ok": True,
@@ -895,6 +1118,26 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 str(request.get("until", "")),
             ),
         }
+    if op == "journal_diagnostics":
+        return {"ok": True, "result": journal_diagnostics(
+            int(request.get("lines", 200)), int(request.get("since_minutes", 60)),
+            int(request.get("priority_max", 3)), str(request.get("text", "")), bool(request.get("current_boot", True)), False,
+        )}
+    if op == "kernel_diagnostics":
+        return {"ok": True, "result": kernel_diagnostics(
+            int(request.get("lines", 200)), int(request.get("since_minutes", 0)),
+            int(request.get("priority_max", 4)), str(request.get("text", "")),
+        )}
+    if op == "firewall_status":
+        return {"ok": True, "result": firewall_status()}
+    if op == "tailscale_status":
+        return {"ok": True, "result": tailscale_status()}
+    if op == "sysctl_read":
+        return {"ok": True, "result": sysctl_read(str(request.get("key", "")), Path("/"))}
+    if op == "proc_snapshot":
+        return {"ok": True, "result": proc_snapshot(str(request.get("topic", "")), Path("/"))}
+    if op == "routing_diagnostics":
+        return {"ok": True, "result": routing_diagnostics()}
     if op == "docker_containers":
         return {
             "ok": True,
@@ -916,6 +1159,11 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 str(request.get("action", "")),
             ),
         }
+    if op == "recover_joe_tunnel":
+        return {
+            "ok": True,
+            "result": recover_joe_tunnel(request.get("confirm") is True),
+        }
     if op == "docker_logs":
         return {
             "ok": True,
@@ -923,11 +1171,21 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
                 str(request.get("container", "")),
                 int(request.get("lines", 200)),
                 int(request.get("since_minutes", 0)),
+                str(request.get("text", "")),
             ),
         }
     if op == "list_sessions":
         return {"ok": True, "result": _list_sessions()}
     raise ValueError(f"Unsupported bridge operation: {op}")
+
+
+def _write_response(stream: Any, response: dict[str, Any]) -> bool:
+    payload = (json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        stream.write(payload)
+        return True
+    except (BrokenPipeError, ConnectionResetError):
+        return False
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -951,6 +1209,8 @@ class Handler(socketserver.StreamRequestHandler):
                 GitError,
                 JournalError,
                 LocalHTTPError,
+                LinuxDiagnosticError,
+                ProcessControlDenied,
                 SQLiteReadError,
                 WorkspaceDenied,
                 PersistentSessionError,
@@ -965,7 +1225,7 @@ class Handler(socketserver.StreamRequestHandler):
                 response = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
             except Exception:
                 response = {"ok": False, "error": "Internal bridge error", "error_type": "InternalError"}
-        self.wfile.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+        _write_response(self.wfile, response)
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

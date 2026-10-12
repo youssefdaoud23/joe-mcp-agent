@@ -6,6 +6,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
 from typing import Any
 
 from src.security import redact_text
@@ -103,3 +104,54 @@ def read_url(url: str, timeout_seconds: float = 10.0, max_bytes: int = MAX_URL_B
     else:
         result["content_omitted"] = "binary response is not returned unless it is an image"
     return result
+
+SAFE_PROBE_HEADERS = {"content-type", "content-length", "date", "server", "location", "cache-control", "etag", "last-modified"}
+
+
+def http_probe(url: str, method: str = "HEAD", timeout_seconds: float = 10.0, max_bytes: int = 32768) -> dict[str, Any]:
+    parsed = _validate_url(url)
+    verb = str(method or "HEAD").strip().upper()
+    if verb not in {"HEAD", "GET"}:
+        raise URLReadError("HTTP probe supports only HEAD and GET")
+    limit = max(0, min(int(max_bytes), 100_000))
+    timeout = max(1.0, min(float(timeout_seconds), 20.0))
+    request = urllib.request.Request(
+        parsed.geturl(),
+        headers={"User-Agent": "JoeMCP-Probe/1", "Accept": "*/*"},
+        method=verb,
+    )
+    opener = urllib.request.build_opener(_SafeRedirect())
+    started = time.monotonic()
+    response = None
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise URLReadError(f"HTTP probe failed: {exc}") from exc
+    try:
+        final_url = response.geturl()
+        _validate_url(final_url)
+        status = int(getattr(response, "status", getattr(response, "code", 0)) or 0)
+        headers = {
+            str(key).lower(): str(value)[:2000]
+            for key, value in response.headers.items()
+            if str(key).lower() in SAFE_PROBE_HEADERS
+        }
+        raw = response.read(limit + 1) if verb == "GET" and limit > 0 else b""
+    finally:
+        response.close()
+    truncated = len(raw) > limit
+    raw = raw[:limit]
+    result: dict[str, Any] = {
+        "url": parsed.geturl(), "final_url": final_url, "method": verb, "status": status,
+        "ok": 200 <= status < 400, "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "headers": headers, "bytes": len(raw), "truncated": truncated,
+    }
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if raw and (content_type.startswith("text/") or content_type in {"application/json", "application/xml", "application/xhtml+xml", "application/javascript"}):
+        result["content"] = redact_text(raw.decode("utf-8", errors="replace"), max_chars=limit)
+    elif raw:
+        result["content_omitted"] = "non-text probe response body omitted"
+    return result
+

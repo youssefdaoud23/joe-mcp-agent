@@ -28,11 +28,24 @@ def load_workspace_policy(path: Path | None = None) -> dict[str, Any]:
         raise WorkspaceDenied("Workspace policy is unavailable") from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise WorkspaceDenied("Workspace policy is invalid") from exc
-    if not isinstance(data, dict) or data.get("version") != 1:
+    if not isinstance(data, dict) or data.get("version") not in {1, 2}:
         raise WorkspaceDenied("Unsupported workspace policy version")
     workspaces = data.get("workspaces")
     if not isinstance(workspaces, dict) or len(workspaces) > MAX_WORKSPACES:
         raise WorkspaceDenied("Workspace policy has an invalid workspace map")
+    if data.get("version") == 1:
+        for profile in workspaces.values():
+            if not isinstance(profile, dict):
+                continue
+            shell = profile.get("shell")
+            if not isinstance(shell, dict):
+                shell = {}
+                profile["shell"] = shell
+            shell["enabled"] = True
+            shell.setdefault("executable", "/bin/bash")
+            shell.setdefault("max_runtime_seconds", 600)
+            shell["network"] = "isolated"
+        data["version"] = 2
     return data
 
 
@@ -81,6 +94,7 @@ def _effective_access(profile: dict[str, Any]) -> dict[str, Any]:
     permissions = profile.get("permissions", {}) if isinstance(profile.get("permissions"), dict) else {}
     python = _public_exec_section(profile.get("python"))
     pytest = _public_exec_section(profile.get("pytest"))
+    shell = _public_shell_section(profile.get("shell"))
     sqlite = _public_sqlite_section(profile.get("sqlite"))
     http = _public_http_section(profile.get("http"))
     deployment = _public_deployment_section(profile.get("deployment"))
@@ -102,6 +116,7 @@ def _effective_access(profile: dict[str, Any]) -> dict[str, Any]:
         "execution": {
             "python": bool(python.get("enabled", False)),
             "pytest": bool(pytest.get("enabled", False)),
+            "shell": bool(shell.get("enabled", False)),
             "sqlite_read": bool(sqlite.get("enabled", False)),
             "localhost_http": bool(http.get("enabled", False)),
             "deploy": bool(permissions.get("deploy", False)),
@@ -138,13 +153,68 @@ def workspace_profiles(path: Path | None = None) -> dict[str, Any]:
             "permissions": profile["permissions"],
             "python": _public_exec_section(profile.get("python")),
             "pytest": _public_exec_section(profile.get("pytest")),
+            "shell": _public_shell_section(profile.get("shell")),
             "sqlite": _public_sqlite_section(profile.get("sqlite")),
             "http": _public_http_section(profile.get("http")),
             "deployment": _public_deployment_section(profile.get("deployment")),
         }
         public["effective"] = _effective_access(profile)
         profiles.append(public)
-    return {"version": 1, "workspaces": profiles}
+    return {"version": 2, "workspaces": profiles}
+
+
+def set_workspace_http_ports(
+    name: str,
+    ports: list[int],
+    confirm: bool = False,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Replace one existing workspace's loopback HTTP port allow-list."""
+    if confirm is not True:
+        raise WorkspaceDenied("Changing workspace localhost HTTP ports requires confirm=true")
+    if not isinstance(ports, list):
+        raise WorkspaceDenied("ports must be a list")
+    normalized: list[int] = []
+    for raw in ports:
+        if isinstance(raw, bool):
+            raise WorkspaceDenied("localhost HTTP ports must be integers")
+        try:
+            port = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceDenied("localhost HTTP ports must be integers") from exc
+        if port < 1 or port > 65535:
+            raise WorkspaceDenied(f"Invalid localhost HTTP port: {port}")
+        if port not in normalized:
+            normalized.append(port)
+    if len(normalized) > 32:
+        raise WorkspaceDenied("At most 32 localhost HTTP ports may be allow-listed")
+    target = path or WORKSPACES_FILE
+    if target.is_symlink():
+        raise WorkspaceDenied("Workspace policy path cannot be a symlink")
+    key = str(name or "").strip()
+    if not WORKSPACE_RE.fullmatch(key):
+        raise WorkspaceDenied("Invalid workspace name")
+    data = load_workspace_policy(target)
+    raw = data.get("workspaces", {}).get(key)
+    if not isinstance(raw, dict):
+        raise WorkspaceDenied(f"Unknown workspace: {key}")
+    section = raw.get("http")
+    if not isinstance(section, dict):
+        section = {"enabled": False}
+        raw["http"] = section
+    section["allowed_ports"] = sorted(normalized)
+    temp = target.with_name(f".{target.name}.tmp")
+    try:
+        temp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    except OSError as exc:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorkspaceDenied("Unable to save workspace policy") from exc
+    return workspace_profiles(target)
 
 
 def update_workspace_capabilities(
@@ -185,7 +255,7 @@ def update_workspace_capabilities(
                 raise WorkspaceDenied(f"Workspace permission must be boolean: {permission}")
             current[permission] = value
 
-    feature_names = {"python", "pytest", "sqlite", "http"}
+    feature_names = {"python", "pytest", "shell", "sqlite", "http"}
     if features is not None:
         if not isinstance(features, dict):
             raise WorkspaceDenied("features must be an object")
@@ -222,6 +292,16 @@ def _public_exec_section(value: Any) -> dict[str, Any]:
         "executable": str(section.get("executable", "/usr/bin/python3") or "/usr/bin/python3"),
         "allowed_globs": list(section.get("allowed_globs", [])) if isinstance(section.get("allowed_globs"), list) else [],
         "max_runtime_seconds": int(section.get("max_runtime_seconds", 0) or 0),
+        "network": str(section.get("network", "isolated") or "isolated"),
+    }
+
+
+def _public_shell_section(value: Any) -> dict[str, Any]:
+    section = value if isinstance(value, dict) else {}
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "executable": str(section.get("executable", "/bin/bash") or "/bin/bash"),
+        "max_runtime_seconds": int(section.get("max_runtime_seconds", 600) or 600),
         "network": str(section.get("network", "isolated") or "isolated"),
     }
 

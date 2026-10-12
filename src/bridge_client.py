@@ -162,6 +162,21 @@ def kill_process(session_id: str, force: bool = False) -> dict[str, Any]:
     return request("kill_process", session_id=session_id, force=force)
 
 
+def terminate_host_process(
+    pid: int,
+    expected_start_ticks: int,
+    force: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return request(
+        "terminate_host_process",
+        pid=pid,
+        expected_start_ticks=expected_start_ticks,
+        force=force,
+        confirm=confirm,
+    )
+
+
 def write_file(path: str, content: str, mode: str = "rewrite") -> dict[str, Any]:
     return request("write_file", path=path, content=content, mode=mode)
 
@@ -224,6 +239,18 @@ def git_log(path: str, max_count: int = 20) -> dict[str, Any]:
     return request("git_log", path=path, max_count=max_count)
 
 
+def git_compare_branches(path: str, left: str, right: str, max_commits: int = 20) -> dict[str, Any]:
+    return request("git_compare_branches", path=path, left=left, right=right, max_commits=max_commits)
+
+
+def git_merge_preview(path: str, destination: str, source: str, max_bytes: int = 200_000) -> dict[str, Any]:
+    return request("git_merge_preview", path=path, destination=destination, source=source, max_bytes=max_bytes)
+
+
+def git_merge_branches(path: str, destination: str, source: str, expected_destination_head: str, message: str = "", confirm: bool = False) -> dict[str, Any]:
+    return request("git_merge_branches", path=path, destination=destination, source=source, expected_destination_head=expected_destination_head, message=message, confirm=confirm)
+
+
 def git_stage(path: str, paths: list[str]) -> dict[str, Any]:
     return request("git_stage", path=path, paths=paths)
 
@@ -244,12 +271,52 @@ def service_status(unit: str) -> dict[str, Any]:
     return request("service_status", unit=unit)
 
 
+def systemd_failed_units(max_results: int = 200) -> dict[str, Any]:
+    return request("systemd_failed_units", max_results=max_results)
+
+
 def service_action(unit: str, action: str) -> dict[str, Any]:
     return request("service_action", unit=unit, action=action)
 
 
+def unit_action(unit: str, action: str, confirm: bool = False) -> dict[str, Any]:
+    return request("unit_action", unit=unit, action=action, confirm=confirm)
+
+
+def update_systemd_unit_policy(allowed_units: list[str], allowed_actions: list[str], enabled: bool | None = None, confirm: bool = False) -> dict[str, Any]:
+    return request("update_systemd_unit_policy", allowed_units=allowed_units, allowed_actions=allowed_actions, enabled=enabled, confirm=confirm)
+
+
 def journal_logs(unit: str, lines: int = 200, since_minutes: int = 0, text: str = "", since: str = "", until: str = "") -> dict[str, Any]:
     return request("journal_logs", unit=unit, lines=lines, since_minutes=since_minutes, text=text, since=since, until=until)
+
+
+def journal_diagnostics(lines: int = 200, since_minutes: int = 60, priority_max: int = 3, text: str = "", current_boot: bool = True) -> dict[str, Any]:
+    return request("journal_diagnostics", lines=lines, since_minutes=since_minutes, priority_max=priority_max, text=text, current_boot=current_boot)
+
+
+def kernel_diagnostics(lines: int = 200, since_minutes: int = 0, priority_max: int = 4, text: str = "") -> dict[str, Any]:
+    return request("kernel_diagnostics", lines=lines, since_minutes=since_minutes, priority_max=priority_max, text=text)
+
+
+def firewall_status() -> dict[str, Any]:
+    return request("firewall_status")
+
+
+def tailscale_status() -> dict[str, Any]:
+    return request("tailscale_status")
+
+
+def sysctl_read(key: str) -> dict[str, Any]:
+    return request("sysctl_read", key=key)
+
+
+def proc_snapshot(topic: str) -> dict[str, Any]:
+    return request("proc_snapshot", topic=topic)
+
+
+def routing_diagnostics() -> dict[str, Any]:
+    return request("routing_diagnostics")
 
 
 def docker_containers(pattern: str = "*", max_results: int = 200) -> dict[str, Any]:
@@ -264,13 +331,18 @@ def docker_action(container: str, action: str) -> dict[str, Any]:
     return request("docker_action", timeout=DOCKER_ACTION_TIMEOUT, container=container, action=action)
 
 
-def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dict[str, Any]:
+def recover_joe_tunnel(confirm: bool = False) -> dict[str, Any]:
+    return request("recover_joe_tunnel", timeout=60.0, confirm=confirm)
+
+
+def docker_logs(container: str, lines: int = 200, since_minutes: int = 0, text: str = "") -> dict[str, Any]:
     return request(
         "docker_logs",
         timeout=DOCKER_READ_TIMEOUT,
         container=container,
         lines=lines,
         since_minutes=since_minutes,
+        text=text,
     )
 
 
@@ -280,6 +352,10 @@ def list_sessions() -> dict[str, Any]:
 
 def workspace_profiles() -> dict[str, Any]:
     return request("workspace_profiles")
+
+
+def set_workspace_http_ports(workspace: str, ports: list[int], confirm: bool = False) -> dict[str, Any]:
+    return request("set_workspace_http_ports", workspace=workspace, ports=ports, confirm=confirm)
 
 
 def start_workspace_python(workspace: str, script: str, args: list[str] | None = None) -> dict[str, Any]:
@@ -292,6 +368,31 @@ def start_workspace_python_code(workspace: str, code: str, args: list[str] | Non
 
 def start_workspace_node_check(workspace: str, script: str) -> dict[str, Any]:
     return request("start_workspace_node_check", workspace=workspace, script=script)
+
+
+def start_workspace_shell(workspace: str, command: str, confirm: bool = False) -> dict[str, Any]:
+    return request("start_workspace_shell", workspace=workspace, command=command, confirm=confirm)
+
+
+def start_managed_terminal(
+    profile: str,
+    command: str,
+    cwd: str,
+    write_roots: list[str] | None = None,
+    hidden_paths: list[str] | None = None,
+    read_only_paths: list[str] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    return request(
+        "start_managed_terminal",
+        profile=profile,
+        command=command,
+        cwd=cwd,
+        write_roots=write_roots or [],
+        hidden_paths=hidden_paths or [],
+        read_only_paths=read_only_paths or [],
+        confirm=confirm,
+    )
 
 
 def start_workspace_pytest(workspace: str, targets: list[str] | None = None, args: list[str] | None = None) -> dict[str, Any]:

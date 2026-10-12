@@ -17,12 +17,15 @@ ACTIONS_FILE = Path(
     )
 )
 SERVICE_ACTIONS = {"start", "stop", "restart"}
+SYSTEMD_UNIT_ACTIONS = SERVICE_ACTIONS | {"enable", "disable", "enable_now", "disable_now"}
 DOCKER_ACTIONS = {"start", "stop", "restart"}
 GIT_LOCAL_ACTIONS = {"stage", "commit", "branch_create", "branch_switch", "reset"}
 GIT_ACTIONS = GIT_LOCAL_ACTIONS | {"push"}
 PROTECTED_SERVICE_UNITS = {"joe-mcp-host-bridge.service", "joe-mcp-session-host.service", "joe-mcp-node-agent.service", "joe-mcp-controller-deploy.service"}
+PROTECTED_SYSTEMD_UNITS = set(PROTECTED_SERVICE_UNITS)
 PROTECTED_CONTAINERS = {"joe-mcp-server", "joe-mcp-tunnel", "joe-mcp-node", "joe-node-agent"}
 SERVICE_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,256}\.service$")
+SYSTEMD_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,256}\.(?:service|timer)$")
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 MAX_POLICY_ITEMS = 200
 
@@ -127,12 +130,31 @@ def authorize_service_action(unit: str, action: str, path: Path | None = None) -
         raise ActionDenied("Only start, stop, and restart service actions are supported")
     if not bool(policy.get("enabled", False)):
         raise ActionDenied("Systemd service control is disabled by policy")
-    if normalized_action not in _clean_actions(policy.get("allowed_actions", []), SERVICE_ACTIONS, "systemd"):
+    if normalized_action not in _clean_actions(policy.get("allowed_actions", []), SYSTEMD_UNIT_ACTIONS, "systemd"):
         raise ActionDenied(f"Systemd action is not allowed by policy: {normalized_action}")
     if unit not in _clean_targets(
-        policy.get("allowed_units", []), SERVICE_UNIT_RE, PROTECTED_SERVICE_UNITS, "systemd service"
+        policy.get("allowed_units", []), SYSTEMD_UNIT_RE, PROTECTED_SYSTEMD_UNITS, "systemd unit"
     ):
         raise ActionDenied(f"Systemd service is not allow-listed: {unit}")
+
+
+def authorize_systemd_unit_action(unit: str, action: str, path: Path | None = None) -> None:
+    policy = _section("service_control", path)
+    normalized_action = str(action or "").strip().lower()
+    if unit in PROTECTED_SYSTEMD_UNITS:
+        raise ActionDenied(f"Protected systemd unit cannot be controlled: {unit}")
+    if not SYSTEMD_UNIT_RE.fullmatch(unit):
+        raise ActionDenied(f"Unsupported systemd unit target: {unit}")
+    if normalized_action not in SYSTEMD_UNIT_ACTIONS:
+        raise ActionDenied("Unsupported systemd unit action")
+    if not bool(policy.get("enabled", False)):
+        raise ActionDenied("Systemd unit control is disabled by policy")
+    if normalized_action not in _clean_actions(policy.get("allowed_actions", []), SYSTEMD_UNIT_ACTIONS, "systemd"):
+        raise ActionDenied(f"Systemd action is not allowed by policy: {normalized_action}")
+    if unit not in _clean_targets(
+        policy.get("allowed_units", []), SYSTEMD_UNIT_RE, PROTECTED_SYSTEMD_UNITS, "systemd unit"
+    ):
+        raise ActionDenied(f"Systemd unit is not allow-listed: {unit}")
 
 
 def authorize_docker_action(container: str, action: str, path: Path | None = None) -> None:
@@ -203,6 +225,29 @@ def update_action_capabilities(
     )
 
 
+def update_systemd_unit_policy(
+    allowed_units: list[str],
+    allowed_actions: list[str],
+    enabled: bool | None = None,
+    confirm: bool = False,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Replace only the systemd allow-list/action set after explicit confirmation."""
+    if confirm is not True:
+        raise ActionDenied("Changing systemd unit policy requires confirm=true")
+    target = path or ACTIONS_FILE
+    current = action_policy_info(target)
+    service = current["service_control"]
+    return update_action_policy(
+        service_control={
+            "enabled": service["enabled"] if enabled is None else bool(enabled),
+            "allowed_units": allowed_units,
+            "allowed_actions": allowed_actions,
+        },
+        path=target,
+    )
+
+
 def update_action_policy(
     service_control: dict[str, Any] | None = None,
     docker_control: dict[str, Any] | None = None,
@@ -220,10 +265,10 @@ def update_action_policy(
         data["service_control"] = {
             "enabled": bool(service_control.get("enabled", False)),
             "allowed_units": _clean_targets(
-                service_control.get("allowed_units", []), SERVICE_UNIT_RE, PROTECTED_SERVICE_UNITS, "systemd service"
+                service_control.get("allowed_units", []), SYSTEMD_UNIT_RE, PROTECTED_SYSTEMD_UNITS, "systemd unit"
             ),
             "allowed_actions": _clean_actions(
-                service_control.get("allowed_actions", []), SERVICE_ACTIONS, "systemd"
+                service_control.get("allowed_actions", []), SYSTEMD_UNIT_ACTIONS, "systemd"
             ),
         }
 

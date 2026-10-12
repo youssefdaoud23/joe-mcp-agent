@@ -4,6 +4,7 @@ import fnmatch
 import json
 import re
 import subprocess
+import time
 from typing import Any
 
 from src.action_policy import authorize_docker_action
@@ -23,9 +24,14 @@ CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 MAX_RESULTS = 500
 MAX_OUTPUT_BYTES = 500_000
 MAX_LOG_LINES = 500
+MAX_LOG_SCAN_LINES = 2500
+MAX_LOG_TEXT_FILTER = 500
 MAX_LOG_SINCE_MINUTES = 10_080
 MAX_LOG_STREAM_BYTES = 1_000_000
 MAX_LOG_MESSAGE_CHARS = 4000
+JOE_PROJECT_DIR = "/opt/joe-mcp-server"
+JOE_COMPOSE_FILE = f"{JOE_PROJECT_DIR}/docker-compose.yml"
+JOE_TUNNEL_CONTAINER = "joe-mcp-tunnel"
 
 
 class DockerError(RuntimeError):
@@ -180,11 +186,65 @@ def docker_action(container: str, action: str) -> dict[str, Any]:
     }
 
 
-def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dict[str, Any]:
+def recover_joe_tunnel(confirm: bool = False) -> dict[str, Any]:
+    """Recreate only Joe's protected tunnel from the fixed controller Compose project."""
+    if confirm is not True:
+        raise DockerError("confirm=true is required to recreate the Joe secure tunnel")
+
+    before = docker_container_status(JOE_TUNNEL_CONTAINER)
+    _run(
+        [
+            "compose",
+            "-f", JOE_COMPOSE_FILE,
+            "--project-directory", JOE_PROJECT_DIR,
+            "--profile", "tunnel",
+            "up", "-d", "--no-deps", "--force-recreate", JOE_TUNNEL_CONTAINER,
+        ],
+        timeout=180.0,
+        max_bytes=12_000,
+    )
+
+    deadline = time.monotonic() + 45.0
+    after = docker_container_status(JOE_TUNNEL_CONTAINER)
+    while time.monotonic() < deadline:
+        if not after.get("running"):
+            raise DockerError("Joe secure tunnel failed to remain running after recreation")
+        if after.get("health") == "healthy":
+            break
+        time.sleep(1.0)
+        after = docker_container_status(JOE_TUNNEL_CONTAINER)
+
+    return {
+        "container": JOE_TUNNEL_CONTAINER,
+        "action": "recreate",
+        "confirmed": True,
+        "before": {
+            "state": before.get("state"),
+            "running": before.get("running"),
+            "pid": before.get("pid"),
+            "restart_count": before.get("restart_count"),
+            "health": before.get("health"),
+        },
+        "after": {
+            "state": after.get("state"),
+            "running": after.get("running"),
+            "pid": after.get("pid"),
+            "restart_count": after.get("restart_count"),
+            "health": after.get("health"),
+        },
+        "ready_for_verification": bool(after.get("running")),
+    }
+
+
+def docker_logs(container: str, lines: int = 200, since_minutes: int = 0, text: str = "") -> dict[str, Any]:
     target = normalize_container(container)
     line_limit = max(1, min(int(lines), MAX_LOG_LINES))
     since = max(0, min(int(since_minutes), MAX_LOG_SINCE_MINUTES))
-    args = ["logs", "--timestamps", f"--tail={line_limit}"]
+    needle = str(text or "").strip()
+    if len(needle) > MAX_LOG_TEXT_FILTER or any(ch in needle for ch in "\x00\r\n"):
+        raise DockerError("Docker log text filter is invalid or too long")
+    scan_limit = min(MAX_LOG_SCAN_LINES, max(line_limit, line_limit * 5 if needle else line_limit))
+    args = ["logs", "--timestamps", f"--tail={scan_limit}"]
     if since:
         args.append(f"--since={since}m")
     args.append(target)
@@ -206,7 +266,9 @@ def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dic
             raw_entries.append((sort_key, sequence, stream, timestamp, message))
 
     raw_entries.sort(key=lambda item: (item[0], item[1]))
-    selected = raw_entries[-line_limit:]
+    needle_lower = needle.lower()
+    filtered = [item for item in raw_entries if not needle_lower or needle_lower in item[4].lower()]
+    selected = filtered[-line_limit:]
     entries = [
         {
             "timestamp": timestamp,
@@ -218,9 +280,13 @@ def docker_logs(container: str, lines: int = 200, since_minutes: int = 0) -> dic
     return {
         "container": target,
         "requested_lines": line_limit,
+        "scan_lines": scan_limit,
         "since_minutes": since,
+        "text_filter": needle or None,
         "entries": entries,
         "entry_count": len(entries),
+        "matched_total": len(filtered),
+        "truncated": len(filtered) > len(entries),
         "redaction": "enabled",
     }
 

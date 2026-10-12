@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import struct
 from datetime import datetime, timezone
@@ -11,6 +12,16 @@ from src.security import redact_argv
 
 MAX_PROCESSES = 1000
 MAX_PORTS = 2000
+PROTECTED_PROCESS_NAMES = {
+    "systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "sshd", "dockerd",
+    "containerd", "containerd-shim", "docker-proxy", "cloudflared", "tailscaled", "networkmanager",
+    "dbus-daemon", "polkitd", "cron", "crond", "rsyslogd", "agetty", "login", "sudo", "su",
+}
+PROTECTED_CGROUP_MARKERS = (".service", "docker", "containerd", "kubepods", "joe-mcp")
+
+
+class ProcessControlDenied(PermissionError):
+    pass
 
 
 def _read_text(path: Path, limit: int = 65536) -> str:
@@ -160,6 +171,145 @@ def list_open_ports(host_root: Path, max_results: int = 500) -> dict[str, Any]:
     return {"available": proc_root.exists(), "ports": output, "count": len(output), "truncated": len(rows) > len(output)}
 
 
+def _process_cgroup(item: Path) -> str:
+    try:
+        return _read_text(item / "cgroup", 65536).strip()
+    except OSError as exc:
+        raise ProcessControlDenied("Unable to verify process cgroup safety") from exc
+
+
+def _protected_process_reason(stat: dict[str, Any], item: Path) -> str | None:
+    pid = int(stat["pid"])
+    ppid = int(stat["ppid"])
+    name = str(stat["comm"] or "").strip().lower()
+    if pid <= 2:
+        return "core system process"
+    if ppid <= 1:
+        return "daemon or orphan process; use the structured service/container control when applicable"
+    if name.startswith("joe-mcp") or name in PROTECTED_PROCESS_NAMES:
+        return f"protected process name: {stat['comm']}"
+    cgroup = _process_cgroup(item).lower()
+    marker = next((value for value in PROTECTED_CGROUP_MARKERS if value in cgroup), None)
+    if marker:
+        return f"process belongs to a protected service/container cgroup ({marker})"
+    return None
+
+
+def terminate_host_process(
+    host_root: Path,
+    pid: int,
+    expected_start_ticks: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    value = int(pid)
+    expected = int(expected_start_ticks)
+    if value <= 0 or expected <= 0:
+        raise ProcessControlDenied("pid and expected_start_ticks must be positive")
+    proc_root = host_root / "proc"
+    item = proc_root / str(value)
+    if not item.is_dir():
+        raise FileNotFoundError(f"Process not found: {value}")
+    try:
+        stat = _proc_stat(item)
+    except (OSError, ValueError) as exc:
+        raise ProcessControlDenied("Unable to verify process identity") from exc
+    if int(stat["start_ticks"]) != expected:
+        raise ProcessControlDenied("Process identity changed; refresh process_info before retrying")
+    reason = _protected_process_reason(stat, item)
+    if reason:
+        raise ProcessControlDenied(f"Process termination denied: {reason}")
+    sig = signal.SIGKILL if bool(force) else signal.SIGTERM
+    try:
+        os.kill(value, sig)
+    except ProcessLookupError as exc:
+        raise FileNotFoundError(f"Process not found: {value}") from exc
+    except PermissionError as exc:
+        raise ProcessControlDenied("Host denied permission to signal this process") from exc
+    return {
+        "pid": value,
+        "start_ticks": expected,
+        "comm": stat["comm"],
+        "signal": "SIGKILL" if bool(force) else "SIGTERM",
+        "sent": True,
+    }
+
+
+PROCESS_MEMORY_FIELDS = {
+    "VmPeak", "VmSize", "VmHWM", "VmRSS", "RssAnon", "RssFile", "RssShmem",
+    "VmData", "VmStk", "VmExe", "VmLib", "VmPTE", "VmSwap", "Threads",
+}
+CGROUP_MEMORY_STAT_FIELDS = {
+    "anon", "file", "kernel", "kernel_stack", "pagetables", "sock", "slab",
+    "inactive_anon", "active_anon", "inactive_file", "active_file", "pgfault", "pgmajfault",
+}
+
+
+def process_memory_info(host_root: Path, pid: int) -> dict[str, Any]:
+    value = int(pid)
+    if value <= 0:
+        raise ValueError("pid must be positive")
+    proc_root = host_root / "proc"
+    item = proc_root / str(value)
+    if not item.is_dir():
+        raise FileNotFoundError(f"Process not found: {value}")
+    stat = _proc_stat(item)
+    fields: dict[str, int] = {}
+    try:
+        for line in _read_text(item / "status", 65536).splitlines():
+            if ":" not in line:
+                continue
+            key, raw = line.split(":", 1)
+            if key not in PROCESS_MEMORY_FIELDS:
+                continue
+            parts = raw.strip().split()
+            if not parts:
+                continue
+            try:
+                number = int(parts[0])
+            except ValueError:
+                continue
+            fields[key] = number * 1024 if len(parts) > 1 and parts[1].lower() == "kb" else number
+    except OSError as exc:
+        raise FileNotFoundError(f"Process not found: {value}") from exc
+
+    cgroup_path = None
+    cgroup_values: dict[str, int | str | None] = {}
+    try:
+        for line in _process_cgroup(item).splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0":
+                candidate = parts[2].strip()
+                if candidate.startswith("/") and ".." not in Path(candidate).parts:
+                    cgroup_path = candidate
+                break
+    except ProcessControlDenied:
+        cgroup_path = None
+    if cgroup_path:
+        base = host_root / "sys/fs/cgroup" / cgroup_path.lstrip("/")
+        for name in ("memory.current", "memory.peak", "memory.max", "memory.swap.current"):
+            try:
+                raw = _read_text(base / name, 128).strip()
+            except OSError:
+                continue
+            key = name.replace(".", "_")
+            cgroup_values[key] = None if raw == "max" else int(raw) if raw.isdigit() else raw[:128]
+        try:
+            for line in _read_text(base / "memory.stat", 65536).splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in CGROUP_MEMORY_STAT_FIELDS and parts[1].isdigit():
+                    cgroup_values[f"stat_{parts[0]}"] = int(parts[1])
+        except OSError:
+            pass
+    return {
+        "pid": value,
+        "start_ticks": stat["start_ticks"],
+        "comm": stat["comm"],
+        "memory": fields,
+        "cgroup_path": cgroup_path,
+        "cgroup_memory": cgroup_values,
+    }
+
+
 def process_info(host_root: Path, pid: int) -> dict[str, Any]:
     value = int(pid)
     if value <= 0:
@@ -174,6 +324,7 @@ def process_info(host_root: Path, pid: int) -> dict[str, Any]:
     ports = [row for row in all_ports if value in row.get("pids", [])]
     return {
         "pid": value,
+        "start_ticks": stat["start_ticks"],
         "ppid": stat["ppid"],
         "comm": stat["comm"],
         "state": stat["state"],
@@ -201,6 +352,7 @@ def list_processes(host_root: Path, max_processes: int = 200) -> dict[str, Any]:
             stat = _proc_stat(item)
             rows.append({
                 "pid": stat["pid"],
+                "start_ticks": stat["start_ticks"],
                 "ppid": stat["ppid"],
                 "comm": stat["comm"],
                 "state": stat["state"],

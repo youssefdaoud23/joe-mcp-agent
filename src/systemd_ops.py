@@ -6,7 +6,7 @@ import re
 import subprocess
 from typing import Any
 
-from src.action_policy import authorize_service_action
+from src.action_policy import authorize_service_action, authorize_systemd_unit_action
 from src.security import redact_text
 
 
@@ -132,6 +132,26 @@ def list_timers(pattern: str = "*", max_results: int = 200) -> dict[str, Any]:
     return _list_units("timer", pattern, max_results)
 
 
+def failed_units(max_results: int = 200) -> dict[str, Any]:
+    limit = max(1, min(int(max_results), MAX_RESULTS))
+    output = _run(["list-units", "--failed", "--all", "--no-legend", "--no-pager", "--plain"])
+    rows: list[dict[str, str]] = []
+    total = 0
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line == "[TRUNCATED]":
+            continue
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        unit, load, active, sub = parts[:4]
+        description = parts[4] if len(parts) == 5 else ""
+        total += 1
+        if len(rows) < limit:
+            rows.append({"unit": unit, "load": load, "active": active, "sub": sub, "description": description[:500]})
+    return {"units": rows, "result_count": len(rows), "matched_total": total, "truncated": total > len(rows)}
+
+
 STATUS_PROPERTIES = (
     "Id", "Description", "LoadState", "ActiveState", "SubState", "UnitFileState", "Result",
     "MainPID", "ExecMainCode", "ExecMainStatus", "NRestarts", "TasksCurrent", "MemoryCurrent",
@@ -244,6 +264,30 @@ def service_action(unit: str, action: str) -> dict[str, Any]:
         "action": normalized_action,
         "before": {"active_state": before.get("active_state"), "sub_state": before.get("sub_state"), "main_pid": before.get("main_pid")},
         "after": {"active_state": after.get("active_state"), "sub_state": after.get("sub_state"), "main_pid": after.get("main_pid")},
+    }
+
+
+def unit_action(unit: str, action: str, confirm: bool = False) -> dict[str, Any]:
+    normalized = normalize_systemd_unit(unit, {"service", "timer"})
+    normalized_action = str(action or "").strip().lower()
+    authorize_systemd_unit_action(normalized, normalized_action)
+    if normalized_action in {"enable", "disable", "enable_now", "disable_now"} and confirm is not True:
+        raise SystemdError("Changing systemd enablement requires confirm=true")
+    before = service_status(normalized) if normalized.endswith(".service") else timer_status(normalized)
+    if normalized_action == "enable_now":
+        command = ["enable", "--now", normalized]
+    elif normalized_action == "disable_now":
+        command = ["disable", "--now", normalized]
+    else:
+        command = [normalized_action, normalized]
+    _run(command, timeout=30.0, max_bytes=4_000)
+    after = service_status(normalized) if normalized.endswith(".service") else timer_status(normalized)
+    fields = ("active_state", "sub_state", "unit_file_state")
+    return {
+        "unit": normalized,
+        "action": normalized_action,
+        "before": {key: before.get(key) for key in fields},
+        "after": {key: after.get(key) for key in fields},
     }
 
 

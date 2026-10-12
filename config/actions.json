@@ -3,17 +3,37 @@
   "service_control": {
     "enabled": false,
     "allowed_units": [],
-    "allowed_actions": ["start", "stop", "restart"]
+    "allowed_actions": [
+      "start",
+      "stop",
+      "restart",
+      "enable",
+      "disable",
+      "enable_now",
+      "disable_now"
+    ]
   },
   "docker_control": {
     "enabled": false,
     "allowed_containers": [],
-    "allowed_actions": ["start", "stop", "restart"]
+    "allowed_actions": [
+      "start",
+      "stop",
+      "restart"
+    ]
   },
   "git_write": {
     "enabled": false,
-    "allowed_repositories": ["/opt/joe-mcp-server"],
-    "allowed_actions": ["stage", "commit", "branch_create", "branch_switch", "reset"],
+    "allowed_repositories": [
+      "/opt/joe-mcp-server"
+    ],
+    "allowed_actions": [
+      "stage",
+      "commit",
+      "branch_create",
+      "branch_switch",
+      "reset"
+    ],
     "push_enabled": false
   }
 }

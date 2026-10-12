@@ -11,6 +11,7 @@ from src.workspace_policy import WorkspaceDenied, matches_allowed_glob, resolve_
 MAX_ARGS = 64
 MAX_ARG_CHARS = 4096
 MAX_INLINE_CODE_BYTES = 64 * 1024
+MAX_SHELL_COMMAND_BYTES = 64 * 1024
 NODE_CHECK_EXTENSIONS = {".js", ".mjs", ".cjs"}
 PYTEST_SIMPLE_FLAGS = {"-q", "-v", "-vv", "-x", "-s", "--disable-warnings", "--collect-only", "--strict-markers"}
 PYTEST_PREFIX_FLAGS = ("--maxfail=", "--tb=", "--durations=")
@@ -79,6 +80,43 @@ def _python_executable(profile: dict[str, Any], section: dict[str, Any]) -> str:
     if not os.access(candidate, os.X_OK):
         raise WorkspaceDenied("Workspace Python executable is not executable")
     return str(candidate)
+
+def _shell_executable(section: dict[str, Any]) -> str:
+    configured = str(section.get("executable", "/bin/bash") or "/bin/bash").strip()
+    if configured not in {"/bin/bash", "/bin/sh"}:
+        raise WorkspaceDenied("Workspace shell executable must be /bin/bash or /bin/sh")
+    candidate = Path(configured)
+    if not candidate.exists() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise FileNotFoundError(configured)
+    resolved = candidate.resolve(strict=True)
+    if resolved not in {Path("/usr/bin/bash"), Path("/usr/bin/dash")} and resolved != candidate:
+        raise WorkspaceDenied("Workspace shell resolves outside the approved system shell runtime")
+    return configured
+
+
+def build_shell_command(workspace: str, command: str) -> dict[str, Any]:
+    profile = resolve_workspace(workspace, "modify")
+    section = dict(profile.get("shell", {})) if isinstance(profile.get("shell"), dict) else {}
+    if not bool(section.get("enabled", True)):
+        raise WorkspaceDenied(f"Shell execution is disabled for workspace: {workspace}")
+    section.setdefault("network", "isolated")
+    section.setdefault("max_runtime_seconds", 600)
+    payload = str(command or "")
+    encoded = payload.encode("utf-8")
+    if not payload.strip() or len(encoded) > MAX_SHELL_COMMAND_BYTES or "\x00" in payload:
+        raise WorkspaceDenied("Workspace shell command must be non-empty, NUL-free, and at most 64 KiB")
+    executable = _shell_executable(section)
+    return {
+        "workspace": profile["name"],
+        "cwd": profile["root"],
+        "argv": [executable, "-s"],
+        "display": f"{Path(executable).name} -s [workspace command via stdin]",
+        "max_runtime_seconds": _runtime(section, 600),
+        "network": _network_mode(section),
+        "workspace_access": "write",
+        "stdin_payload": payload,
+    }
+
 
 def build_python_command(workspace: str, script: str, args: Any = None) -> dict[str, Any]:
     profile, candidate, relative = workspace_relative_path(workspace, script, "modify")
