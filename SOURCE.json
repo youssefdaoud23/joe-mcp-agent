@@ -5,6 +5,6 @@
   "managed_runtime_files": 56,
   "name": "joe-mcp-agent",
   "schema_version": 1,
-  "source_commit": "d20337bc835c32e905283745895301cfa675e53b",
+  "source_commit": "37f933677ba8d44032f874e5cc65d0037a0e7c09",
   "source_private_repository": "joe-mcp-server"
 }
