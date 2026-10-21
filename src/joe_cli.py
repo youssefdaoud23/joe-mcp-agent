@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-JOE_VERSION = os.getenv("JOE_VERSION", "0.33.0")
+JOE_VERSION = os.getenv("JOE_VERSION", "0.37.4")
 DEVICE_CONFIG = Path("/var/lib/joe-mcp-agent/config.json")
 CONTROLLER_HEALTH = "http://127.0.0.1:8765/health"
 TUNNEL_HEALTH = "http://127.0.0.1:8766/readyz"

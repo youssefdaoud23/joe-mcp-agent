@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import posixpath
 import re
@@ -98,6 +99,115 @@ def resolve_repo(path: str) -> Path:
     return root
 
 
+def _run_code(repo: Path, args: list[str], timeout: float = 8.0) -> int:
+    try:
+        completed = subprocess.run(
+            [
+                "git", "-C", str(repo),
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=false",
+                "-c", "credential.helper=",
+                *args,
+            ],
+            env=GIT_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise GitError("git executable is unavailable on the host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError("git operation timed out") from exc
+    if completed.returncode not in {0, 1}:
+        message = completed.stderr[:4000].decode("utf-8", errors="replace").strip()
+        raise GitError(message or f"git exited with status {completed.returncode}")
+    return completed.returncode
+
+
+def _git_directory_info(repo: Path) -> dict[str, Any]:
+    git_dir_raw = _run(repo, ["rev-parse", "--absolute-git-dir"], max_bytes=16_000).strip()
+    common_raw = _run(repo, ["rev-parse", "--git-common-dir"], max_bytes=16_000).strip()
+    if not git_dir_raw.startswith("/"):
+        raise GitError("Git returned an invalid worktree metadata directory")
+    git_dir = Path(git_dir_raw).resolve(strict=False)
+    common = Path(common_raw)
+    if not common.is_absolute():
+        common = (repo / common).resolve(strict=False)
+    else:
+        common = common.resolve(strict=False)
+    return {
+        "git_directory": str(git_dir),
+        "common_git_directory": str(common),
+        "worktree_kind": "linked" if git_dir != common else "main",
+        "linked_worktree": git_dir != common,
+    }
+
+
+def _changed_paths_between(repo: Path, before: str, after: str) -> list[str]:
+    if not before or not after or before == after:
+        return []
+    raw = _run(repo, ["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", before, after, "--"], max_bytes=1_000_000)
+    paths = [item for item in raw.split("\x00") if item and item != "[TRUNCATED]"]
+    safe, _hidden = _safe_repo_paths(repo, paths)
+    return safe[:MAX_DIFF_PATHS]
+
+
+def _worktree_state(repo: Path) -> dict[str, Any]:
+    branch = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
+    head = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    head_tree = _run(repo, ["rev-parse", "HEAD^{tree}"], max_bytes=4096).strip()
+    staged, unstaged, untracked, restricted = _change_sets(repo)
+    index_matches_head = _run_code(repo, ["diff", "--cached", "--quiet", "HEAD", "--"]) == 0
+    worktree_matches_index = _run_code(repo, ["diff", "--quiet", "--"]) == 0
+    clean = not staged and not unstaged and not untracked and restricted == 0
+    matches_head = clean and index_matches_head and worktree_matches_index
+    index_tree = head_tree if index_matches_head else None
+    info = _git_directory_info(repo)
+    return {
+        "repository": str(repo),
+        "branch": branch or None,
+        "head": head,
+        "head_tree_hash": head_tree,
+        "index_tree_hash": index_tree,
+        "worktree_tree_hash": index_tree if worktree_matches_index else None,
+        "index_matches_head": index_matches_head,
+        "worktree_matches_index": worktree_matches_index,
+        "worktree_matches_head": matches_head,
+        "clean": clean,
+        "staged": staged[:MAX_DIFF_PATHS],
+        "unstaged": unstaged[:MAX_DIFF_PATHS],
+        "untracked": untracked[:MAX_DIFF_PATHS],
+        "restricted_paths_hidden": restricted,
+        **info,
+    }
+
+
+def _verify_checkout_state(repo: Path, expected_commit: str, operation: str) -> dict[str, Any]:
+    state = _worktree_state(repo)
+    if state["head"] != expected_commit:
+        raise GitError(f"{operation} did not move HEAD to the requested commit")
+    if not state["worktree_matches_head"]:
+        raise GitError(f"{operation} changed Git metadata but the index/worktree does not exactly match HEAD")
+    return state
+
+
+def _file_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _safe_repo_relpath(repo: Path, value: str) -> str | None:
     rel = str(value or "").strip()
     if not rel or rel.startswith("/") or "\x00" in rel:
@@ -153,13 +263,10 @@ def _untracked(repo: Path) -> list[str]:
 
 def git_status(path: str) -> dict[str, Any]:
     repo = resolve_repo(path)
-    branch = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
-    if not branch:
-        branch = f"detached@{_run(repo, ['rev-parse', '--short', 'HEAD'], max_bytes=4096).strip()}"
-
-    staged, staged_hidden = _safe_repo_paths(repo, _name_only(repo, True))
-    unstaged, unstaged_hidden = _safe_repo_paths(repo, _name_only(repo, False))
-    untracked, untracked_hidden = _safe_repo_paths(repo, _untracked(repo))
+    state = _worktree_state(repo)
+    display_branch = state["branch"]
+    if not display_branch:
+        display_branch = f"detached@{_run(repo, ['rev-parse', '--short', 'HEAD'], max_bytes=4096).strip()}"
 
     upstream = None
     ahead = behind = None
@@ -172,17 +279,12 @@ def git_status(path: str) -> dict[str, Any]:
         upstream = None
 
     return {
-        "repository": str(repo),
-        "branch": branch,
+        **state,
+        "branch": display_branch,
         "upstream": upstream,
         "ahead": ahead,
         "behind": behind,
-        "staged": staged[:MAX_DIFF_PATHS],
-        "unstaged": unstaged[:MAX_DIFF_PATHS],
-        "untracked": untracked[:MAX_DIFF_PATHS],
-        "restricted_paths_hidden": staged_hidden + unstaged_hidden + untracked_hidden,
-        "clean": not staged and not unstaged and not untracked,
-        "paths_truncated": any(len(items) > MAX_DIFF_PATHS for items in (staged, unstaged, untracked)),
+        "paths_truncated": any(len(state[key]) >= MAX_DIFF_PATHS for key in ("staged", "unstaged", "untracked")),
     }
 
 
@@ -323,6 +425,7 @@ def git_stage(path: str, paths: list[str]) -> dict[str, Any]:
         if normalized not in selected:
             selected.append(normalized)
 
+    before_state = _worktree_state(repo)
     staged_before, unstaged_before, untracked_before, restricted = _change_sets(repo)
     if restricted:
         raise GitError("Repository contains restricted changed paths; Git staging is blocked")
@@ -336,11 +439,25 @@ def git_stage(path: str, paths: list[str]) -> dict[str, Any]:
     staged_after, _, _, restricted_after = _change_sets(repo)
     if restricted_after:
         raise GitError("Restricted path appeared in the staged set")
+    after_state = _worktree_state(repo)
     return {
         "repository": str(repo),
         "staged_paths": selected,
         "staged": staged_after[:MAX_DIFF_PATHS],
         "staged_count": len(staged_after),
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": before_state["head"],
+        "head_after": after_state["head"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": selected,
+        "files_actually_updated": False,
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
     }
 
 
@@ -359,6 +476,7 @@ def git_commit(path: str, message: str) -> dict[str, Any]:
     repo = resolve_repo(path)
     authorize_git_action(str(repo), "commit")
     subject = _commit_message(message)
+    before_state = _worktree_state(repo)
     staged, staged_hidden = _safe_repo_paths(repo, _name_only(repo, True))
     if staged_hidden:
         raise GitError("Restricted path is present in the Git index; commit is blocked")
@@ -382,14 +500,29 @@ def git_commit(path: str, message: str) -> dict[str, Any]:
     )
     commit = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
     short = _run(repo, ["rev-parse", "--short", "HEAD"], max_bytes=4096).strip()
-    branch = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
+    after_state = _worktree_state(repo)
+    if after_state["head"] != commit:
+        raise GitError("Git commit completed but HEAD verification failed")
     return {
         "repository": str(repo),
         "commit": commit,
         "short": short,
-        "branch": branch,
+        "branch": after_state["branch"],
         "subject": subject,
         "paths": staged[:MAX_DIFF_PATHS],
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": before_state["head"],
+        "head_after": after_state["head"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": staged[:MAX_DIFF_PATHS],
+        "files_actually_updated": False,
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
     }
 
 
@@ -435,6 +568,7 @@ def _push_target(repo: Path, remote: str, expected_branch: str) -> tuple[str, st
 def git_push(path: str, expected_branch: str, remote: str = "origin") -> dict[str, Any]:
     repo = resolve_repo(path)
     authorize_git_action(str(repo), "push")
+    before_state = _worktree_state(repo)
     staged, unstaged, untracked, restricted = _change_sets(repo)
     if restricted:
         raise GitError("Repository contains restricted changed paths; push is blocked")
@@ -442,17 +576,29 @@ def git_push(path: str, expected_branch: str, remote: str = "origin") -> dict[st
         raise GitError("Git push requires a clean worktree and index")
 
     branch, upstream, ahead, _behind = _push_target(repo, remote, expected_branch)
-    commit = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    commit = str(before_state["head"])
+    base = {
+        "repository": str(repo),
+        "remote": remote,
+        "branch": branch,
+        "upstream": upstream,
+        "commit": commit,
+        "branch_before": before_state["branch"],
+        "branch_after": before_state["branch"],
+        "head_before": commit,
+        "head_after": commit,
+        "worktree_tree_hash": before_state["worktree_tree_hash"],
+        "worktree_matches_head": before_state["worktree_matches_head"],
+        "clean": before_state["clean"],
+        "changed_paths": [],
+        "files_actually_updated": False,
+        "git_directory": before_state["git_directory"],
+        "common_git_directory": before_state["common_git_directory"],
+        "worktree_kind": before_state["worktree_kind"],
+        "linked_worktree": before_state["linked_worktree"],
+    }
     if ahead == 0:
-        return {
-            "repository": str(repo),
-            "remote": remote,
-            "branch": branch,
-            "upstream": upstream,
-            "commit": commit,
-            "pushed": False,
-            "already_up_to_date": True,
-        }
+        return {**base, "pushed": False, "already_up_to_date": True}
 
     credentials = git_credentials_info()
     provider = str(credentials.get("provider") or "")
@@ -476,22 +622,11 @@ def git_push(path: str, expected_branch: str, remote: str = "origin") -> dict[st
         f"refs/heads/{branch}:refs/heads/{branch}",
     ])
 
-    _run(
-        repo,
-        push_args,
-        timeout=60.0,
-        max_bytes=32_000,
-        extra_env=push_env,
-    )
-    return {
-        "repository": str(repo),
-        "remote": remote,
-        "branch": branch,
-        "upstream": upstream,
-        "commit": commit,
-        "pushed": True,
-        "commits_pushed": ahead,
-    }
+    _run(repo, push_args, timeout=60.0, max_bytes=32_000, extra_env=push_env)
+    after_state = _worktree_state(repo)
+    if after_state["head"] != commit or not after_state["worktree_matches_head"]:
+        raise GitError("Git push unexpectedly changed or dirtied the local worktree")
+    return {**base, "pushed": True, "already_up_to_date": False, "commits_pushed": ahead}
 
 
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -546,6 +681,7 @@ def git_branch_create(path: str, name: str, start_commit: str = "") -> dict[str,
     repo = resolve_repo(path)
     authorize_git_action(str(repo), "branch_create")
     _clean_for_branch_change(repo)
+    before_state = _worktree_state(repo)
     branch = _branch_name(repo, name)
     start = str(start_commit or "").strip()
     if start:
@@ -553,7 +689,7 @@ def git_branch_create(path: str, name: str, start_commit: str = "") -> dict[str,
             raise GitError("Branch start_commit must be a Git commit hash")
         start = _run(repo, ["rev-parse", "--verify", f"{start}^{{commit}}"], max_bytes=4096).strip()
     else:
-        start = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+        start = str(before_state["head"])
     try:
         _run(repo, ["show-ref", "--verify", f"refs/heads/{branch}"], max_bytes=4096)
     except GitError:
@@ -561,7 +697,29 @@ def git_branch_create(path: str, name: str, start_commit: str = "") -> dict[str,
     else:
         raise GitError(f"Git branch already exists: {branch}")
     _run(repo, ["branch", "--no-track", branch, start], timeout=10.0, max_bytes=16_000)
-    return {"repository": str(repo), "branch": branch, "start_commit": start, "created": True}
+    created_commit = _run(repo, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"], max_bytes=4096).strip()
+    if created_commit != start:
+        raise GitError("Created branch does not point to the requested commit")
+    after_state = _worktree_state(repo)
+    return {
+        "repository": str(repo),
+        "branch": branch,
+        "start_commit": start,
+        "created": True,
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": before_state["head"],
+        "head_after": after_state["head"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": [],
+        "files_actually_updated": False,
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
+    }
 
 
 def git_branch_switch(path: str, name: str) -> dict[str, Any]:
@@ -569,11 +727,34 @@ def git_branch_switch(path: str, name: str) -> dict[str, Any]:
     authorize_git_action(str(repo), "branch_switch")
     _clean_for_branch_change(repo)
     branch = _branch_name(repo, name)
-    _run(repo, ["show-ref", "--verify", f"refs/heads/{branch}"], max_bytes=4096)
-    before = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
-    _run(repo, ["switch", "--no-guess", branch], timeout=15.0, max_bytes=16_000)
-    after = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
-    return {"repository": str(repo), "before": before or None, "branch": after or branch, "switched": before != after}
+    target = _run(repo, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"], max_bytes=4096).strip()
+    before_state = _worktree_state(repo)
+    _run(repo, ["switch", "--no-guess", branch], timeout=30.0, max_bytes=32_000)
+    after_state = _verify_checkout_state(repo, target, "Git branch switch")
+    if after_state["branch"] != branch:
+        raise GitError("Git branch switch did not attach HEAD to the requested branch")
+    changed_paths = _changed_paths_between(repo, str(before_state["head"]), str(after_state["head"]))
+    return {
+        "repository": str(repo),
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": before_state["head"],
+        "head_after": after_state["head"],
+        "head_tree_before": before_state["head_tree_hash"],
+        "head_tree_after": after_state["head_tree_hash"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": changed_paths,
+        "files_actually_updated": bool(changed_paths and before_state["head_tree_hash"] != after_state["head_tree_hash"]),
+        "switched": before_state["branch"] != after_state["branch"] or before_state["head"] != after_state["head"],
+        "before": before_state["branch"],
+        "branch": after_state["branch"],
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
+    }
 
 
 def git_reset_to_commit(path: str, target_commit: str, expected_head: str, confirm: bool = False) -> dict[str, Any]:
@@ -586,20 +767,98 @@ def git_reset_to_commit(path: str, target_commit: str, expected_head: str, confi
     expected_raw = str(expected_head or "").strip()
     if not COMMIT_RE.fullmatch(target_raw) or not COMMIT_RE.fullmatch(expected_raw):
         raise GitError("Git reset requires explicit commit hashes")
-    current = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    before_state = _worktree_state(repo)
     expected = _run(repo, ["rev-parse", "--verify", f"{expected_raw}^{{commit}}"], max_bytes=4096).strip()
-    if current != expected:
+    if before_state["head"] != expected:
         raise GitError("Git HEAD changed since approval; reset is blocked")
     target = _run(repo, ["rev-parse", "--verify", f"{target_raw}^{{commit}}"], max_bytes=4096).strip()
-    if target == current:
-        return {"repository": str(repo), "before": current, "after": current, "reset": False}
-    try:
-        _run(repo, ["merge-base", "--is-ancestor", target, current], max_bytes=4096)
-    except GitError as exc:
-        raise GitError("Reset target must be an ancestor of current HEAD") from exc
-    _run(repo, ["reset", "--hard", target], timeout=20.0, max_bytes=32_000)
-    after = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
-    return {"repository": str(repo), "before": current, "after": after, "reset": True, "mode": "hard"}
+    if target != before_state["head"]:
+        try:
+            _run(repo, ["merge-base", "--is-ancestor", target, str(before_state["head"])], max_bytes=4096)
+        except GitError as exc:
+            raise GitError("Reset target must be an ancestor of current HEAD") from exc
+        _run(repo, ["reset", "--hard", target], timeout=30.0, max_bytes=32_000)
+    after_state = _verify_checkout_state(repo, target, "Git hard reset")
+    changed_paths = _changed_paths_between(repo, str(before_state["head"]), str(after_state["head"]))
+    return {
+        "repository": str(repo),
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": before_state["head"],
+        "head_after": after_state["head"],
+        "head_tree_before": before_state["head_tree_hash"],
+        "head_tree_after": after_state["head_tree_hash"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": changed_paths,
+        "files_actually_updated": bool(changed_paths and before_state["head_tree_hash"] != after_state["head_tree_hash"]),
+        "reset": target != before_state["head"],
+        "mode": "hard",
+        "before": before_state["head"],
+        "after": after_state["head"],
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
+    }
+
+
+def git_restore_paths(
+    path: str,
+    source_commit: str,
+    paths: list[str],
+    confirm: bool = False,
+) -> dict[str, Any]:
+    repo = resolve_repo(path)
+    authorize_git_action(str(repo), "reset")
+    if confirm is not True:
+        raise GitError("Restoring files from a commit requires confirm=true")
+    source_raw = str(source_commit or "").strip()
+    if not COMMIT_RE.fullmatch(source_raw):
+        raise GitError("source_commit must be a Git commit hash")
+    source = _run(repo, ["rev-parse", "--verify", f"{source_raw}^{{commit}}"], max_bytes=4096).strip()
+    if not isinstance(paths, list) or not paths:
+        raise GitError("git_restore_paths requires at least one explicit path")
+    if len(paths) > MAX_STAGE_PATHS:
+        raise GitError(f"git_restore_paths accepts at most {MAX_STAGE_PATHS} paths")
+    selected: list[str] = []
+    for raw in paths:
+        normalized = _safe_repo_relpath(repo, str(raw))
+        if normalized is None:
+            raise GitError(f"Git restore path is restricted or invalid: {raw}")
+        if normalized not in selected:
+            selected.append(normalized)
+    for relative in selected:
+        _run(repo, ["cat-file", "-e", f"{source}:{relative}"], max_bytes=4096)
+    before = {relative: _file_sha256(repo / relative) for relative in selected}
+    head_before = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    _run(repo, ["restore", f"--source={source}", "--worktree", "--", *selected], timeout=30.0, max_bytes=32_000)
+    head_after = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    if head_after != head_before:
+        raise GitError("Restoring files unexpectedly changed HEAD")
+    after = {relative: _file_sha256(repo / relative) for relative in selected}
+    status = git_status(str(repo))
+    return {
+        "repository": str(repo),
+        "source_commit": source,
+        "paths": selected,
+        "before_sha256": before,
+        "after_sha256": after,
+        "files_changed": [relative for relative in selected if before.get(relative) != after.get(relative)],
+        "head_before": head_before,
+        "head_after": head_after,
+        "branch": status.get("branch"),
+        "clean": status.get("clean"),
+        "staged": status.get("staged", []),
+        "unstaged": status.get("unstaged", []),
+        "untracked": status.get("untracked", []),
+        "git_directory": status.get("git_directory"),
+        "common_git_directory": status.get("common_git_directory"),
+        "worktree_kind": status.get("worktree_kind"),
+        "linked_worktree": status.get("linked_worktree"),
+        "restore_scope": "worktree_only",
+    }
 
 
 def git_rollback_last(path: str, expected_head: str, confirm: bool = False) -> dict[str, Any]:
@@ -684,6 +943,7 @@ def git_merge_branches(
     if confirm is not True:
         raise GitError("Git branch merge requires confirm=true")
     _clean_for_branch_change(repo)
+    before_state = _worktree_state(repo)
     destination_name, destination_commit = _local_branch(repo, destination)
     source_name, source_commit = _local_branch(repo, source)
     expected = str(expected_destination_head or "").strip().lower()
@@ -694,6 +954,8 @@ def git_merge_branches(
         raise GitError("Destination branch changed; refresh comparison before merging")
     if destination_name == source_name:
         raise GitError("Source and destination branches must be different")
+    if before_state["branch"] != destination_name or before_state["head"] != destination_commit:
+        raise GitError("Merge destination must be the branch currently checked out in the requested worktree")
     preview = git_merge_preview(str(repo), destination_name, source_name, 100_000)
     if preview["conflicts_detected"]:
         raise GitError("Merge preview detected conflicts; merge was not attempted")
@@ -701,45 +963,42 @@ def git_merge_branches(
     stamp = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y%m%d%H%M%S")
     backup = f"backup/joe-pre-merge-{destination_name.replace('/', '-')}-{stamp}"
     _run(repo, ["branch", "--no-track", backup, destination_commit], timeout=10.0, max_bytes=16_000)
-    current = _run(repo, ["branch", "--show-current"], max_bytes=4096).strip()
-    temp_dir: Path | None = None
     try:
-        if current == destination_name:
-            try:
-                _run(repo, ["merge", "--no-ff", "--no-commit", source_commit], timeout=60.0, max_bytes=100_000)
-                _run(repo, ["-c", "commit.gpgSign=false", "commit", "--no-gpg-sign", "-m", subject], timeout=30.0, max_bytes=50_000)
-            except Exception:
-                try:
-                    _run(repo, ["merge", "--abort"], timeout=15.0, max_bytes=16_000)
-                except Exception:
-                    pass
-                raise
-            merged = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
-        else:
-            import tempfile
-            temp_parent = Path(tempfile.mkdtemp(prefix="joe-git-merge-"))
-            temp_dir = temp_parent / "worktree"
-            _run(repo, ["worktree", "add", "--detach", str(temp_dir), destination_commit], timeout=30.0, max_bytes=50_000)
-            try:
-                _run(temp_dir, ["merge", "--no-ff", "--no-commit", source_commit], timeout=60.0, max_bytes=100_000)
-                _run(temp_dir, ["-c", "commit.gpgSign=false", "commit", "--no-gpg-sign", "-m", subject], timeout=30.0, max_bytes=50_000)
-                merged = _run(temp_dir, ["rev-parse", "HEAD"], max_bytes=4096).strip()
-                _run(repo, ["update-ref", f"refs/heads/{destination_name}", merged, destination_commit], timeout=10.0, max_bytes=16_000)
-            finally:
-                try:
-                    _run(repo, ["worktree", "remove", "--force", str(temp_dir)], timeout=30.0, max_bytes=50_000)
-                except Exception:
-                    pass
-        return {
-            "repository": str(repo), "destination": destination_name, "source": source_name,
-            "before": destination_commit, "source_commit": source_commit, "after": merged,
-            "backup_branch": backup, "merge_commit_created": True, "used_temporary_worktree": current != destination_name,
-        }
-    finally:
-        if temp_dir is not None:
-            try:
-                import shutil
-                shutil.rmtree(temp_dir.parent, ignore_errors=True)
-            except Exception:
-                pass
+        _run(repo, ["merge", "--no-ff", "--no-commit", source_commit], timeout=60.0, max_bytes=100_000)
+        _run(repo, ["-c", "commit.gpgSign=false", "commit", "--no-gpg-sign", "-m", subject], timeout=30.0, max_bytes=50_000)
+    except Exception:
+        try:
+            _run(repo, ["merge", "--abort"], timeout=15.0, max_bytes=16_000)
+        except Exception:
+            pass
+        raise
+    merged = _run(repo, ["rev-parse", "HEAD"], max_bytes=4096).strip()
+    after_state = _verify_checkout_state(repo, merged, "Git merge")
+    changed_paths = _changed_paths_between(repo, destination_commit, merged)
+    return {
+        "repository": str(repo),
+        "destination": destination_name,
+        "source": source_name,
+        "source_commit": source_commit,
+        "branch_before": before_state["branch"],
+        "branch_after": after_state["branch"],
+        "head_before": destination_commit,
+        "head_after": merged,
+        "head_tree_before": before_state["head_tree_hash"],
+        "head_tree_after": after_state["head_tree_hash"],
+        "worktree_tree_hash": after_state["worktree_tree_hash"],
+        "worktree_matches_head": after_state["worktree_matches_head"],
+        "clean": after_state["clean"],
+        "changed_paths": changed_paths,
+        "files_actually_updated": bool(changed_paths),
+        "backup_branch": backup,
+        "merge_commit_created": True,
+        "used_temporary_worktree": False,
+        "before": destination_commit,
+        "after": merged,
+        "git_directory": after_state["git_directory"],
+        "common_git_directory": after_state["common_git_directory"],
+        "worktree_kind": after_state["worktree_kind"],
+        "linked_worktree": after_state["linked_worktree"],
+    }
 

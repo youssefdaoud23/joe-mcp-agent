@@ -4,6 +4,7 @@ import fnmatch
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +284,198 @@ def update_workspace_capabilities(
             pass
         raise WorkspaceDenied("Unable to save workspace policy") from exc
     return workspace_profiles(target)
+
+
+
+def register_linked_git_worktree_workspace(
+    base_name: str,
+    name: str,
+    root: str,
+    confirm: bool = False,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Register one linked Git worktree as a writable shell workspace.
+
+    The new root must be a real linked worktree of the selected existing workspace.
+    This never permits / and never accepts an unrelated repository.
+    """
+    if confirm is not True:
+        raise WorkspaceDenied("Registering a linked Git worktree requires confirm=true")
+    key = str(name or "").strip()
+    if not WORKSPACE_RE.fullmatch(key):
+        raise WorkspaceDenied("Invalid workspace name")
+    target = path or WORKSPACES_FILE
+    if target.is_symlink():
+        raise WorkspaceDenied("Workspace policy path cannot be a symlink")
+    data = load_workspace_policy(target)
+    workspaces = data.get("workspaces", {})
+    if not isinstance(workspaces, dict):
+        raise WorkspaceDenied("Workspace policy has an invalid workspace map")
+    if key in workspaces:
+        raise WorkspaceDenied(f"Workspace already exists: {key}")
+    if len(workspaces) >= MAX_WORKSPACES:
+        raise WorkspaceDenied(f"Workspace policy supports at most {MAX_WORKSPACES} workspaces")
+
+    base = _profile(base_name, target)
+    if not base["permissions"].get("read", False) or not base["permissions"].get("modify", False):
+        raise WorkspaceDenied("Base workspace must allow read and modify access")
+    worktree_root = normalize_host_path(str(root or "").strip())
+    if worktree_root == "/":
+        raise WorkspaceDenied("Workspace root cannot be the filesystem root")
+    root_path = Path(worktree_root)
+    if root_path.is_symlink() or not root_path.exists() or not root_path.is_dir():
+        raise WorkspaceDenied("Linked worktree root must be an existing non-symlink directory")
+
+    base_root = Path(base["root"]).resolve(strict=True)
+    base_git = base_root / ".git"
+    if not base_git.is_dir() or base_git.is_symlink():
+        raise WorkspaceDenied("Base workspace must be a primary Git worktree")
+    marker_file = root_path / ".git"
+    if marker_file.is_symlink() or not marker_file.is_file() or marker_file.stat().st_size > 4096:
+        raise WorkspaceDenied("Target must be a linked Git worktree")
+    try:
+        line = marker_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise WorkspaceDenied("Unable to verify linked Git worktree") from exc
+    if not line.startswith("gitdir: "):
+        raise WorkspaceDenied("Target must be a linked Git worktree")
+    gitdir_text = line[8:].strip()
+    gitdir = Path(gitdir_text)
+    if not gitdir.is_absolute():
+        gitdir = (root_path / gitdir).resolve(strict=False)
+    else:
+        gitdir = gitdir.resolve(strict=False)
+    worktrees_dir = (base_git / "worktrees").resolve(strict=False)
+    if gitdir == worktrees_dir or not gitdir.is_relative_to(worktrees_dir) or not gitdir.is_dir():
+        raise WorkspaceDenied("Target is not linked to the selected base workspace")
+    backlink = gitdir / "gitdir"
+    if backlink.is_file() and backlink.stat().st_size <= 4096:
+        try:
+            linked_marker = Path(backlink.read_text(encoding="utf-8").strip()).resolve(strict=False)
+        except (OSError, ValueError) as exc:
+            raise WorkspaceDenied("Unable to verify linked Git worktree backlink") from exc
+        if linked_marker != marker_file.resolve(strict=False):
+            raise WorkspaceDenied("Linked Git worktree backlink does not match target")
+
+    base_raw = workspaces.get(str(base_name or "").strip())
+    if not isinstance(base_raw, dict):
+        raise WorkspaceDenied(f"Unknown workspace: {base_name}")
+    clone = json.loads(json.dumps(base_raw))
+    clone["root"] = worktree_root.rstrip("/") or "/"
+    permissions = clone.get("permissions") if isinstance(clone.get("permissions"), dict) else {}
+    permissions.update({"read": True, "modify": True, "deploy": False})
+    clone["permissions"] = permissions
+    shell = clone.get("shell") if isinstance(clone.get("shell"), dict) else {}
+    shell.update({"enabled": True, "executable": str(shell.get("executable", "/bin/bash") or "/bin/bash"), "network": "isolated"})
+    shell.setdefault("max_runtime_seconds", 600)
+    clone["shell"] = shell
+    clone["deployment"] = {"allowed_services": [], "default_services": [], "health_urls": [], "test_targets": []}
+    workspaces[key] = clone
+    data["version"] = 2
+
+    temp = target.with_name(f".{target.name}.tmp")
+    try:
+        temp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    except OSError as exc:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorkspaceDenied("Unable to save workspace policy") from exc
+    return workspace_profiles(target)
+
+
+def discover_git_worktrees(base_name: str, path: Path | None = None) -> dict[str, Any]:
+    base = resolve_workspace(base_name, "read", path)
+    root = Path(base["root"]).resolve(strict=True)
+    if not (root / ".git").is_dir():
+        raise WorkspaceDenied("Base workspace must be a primary Git worktree")
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+            env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": "/"},
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise WorkspaceDenied("Unable to inspect Git worktrees") from exc
+    if completed.returncode != 0:
+        message = completed.stderr[:2000].decode("utf-8", errors="replace").strip()
+        raise WorkspaceDenied(message or "Unable to inspect Git worktrees")
+    text = completed.stdout[:250_000].decode("utf-8", errors="replace")
+    registered = {
+        str(Path(str(raw.get("root", ""))).resolve(strict=False)): name
+        for name, raw in load_workspace_policy(path).get("workspaces", {}).items()
+        if isinstance(raw, dict) and str(raw.get("root", "")).startswith("/")
+    }
+    rows: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for line in [*text.splitlines(), ""]:
+        if not line:
+            if current.get("path"):
+                worktree_path = str(Path(str(current["path"])).resolve(strict=False))
+                rows.append({
+                    **current,
+                    "path": worktree_path,
+                    "linked": worktree_path != str(root),
+                    "registered_workspace": registered.get(worktree_path),
+                    "eligible_for_workspace_add": worktree_path != str(root) and Path(worktree_path).is_dir(),
+                })
+            current = {}
+            continue
+        if line.startswith("worktree "):
+            current["path"] = line[9:]
+        elif line.startswith("HEAD "):
+            current["head"] = line[5:]
+        elif line.startswith("branch refs/heads/"):
+            current["branch"] = line[len("branch refs/heads/"):]
+        elif line == "detached":
+            current["detached"] = True
+        elif line == "bare":
+            current["bare"] = True
+        elif line.startswith("prunable"):
+            current["prunable"] = True
+    return {"base_workspace": base_name, "base_root": str(root), "worktrees": rows, "count": len(rows)}
+
+
+def remove_workspace(name: str, confirm: bool = False, path: Path | None = None) -> dict[str, Any]:
+    if confirm is not True:
+        raise WorkspaceDenied("Removing a workspace requires confirm=true")
+    key = str(name or "").strip()
+    if not WORKSPACE_RE.fullmatch(key):
+        raise WorkspaceDenied("Invalid workspace name")
+    if key == "joe-mcp":
+        raise WorkspaceDenied("The Joe controller workspace cannot be removed")
+    target = path or WORKSPACES_FILE
+    if target.is_symlink():
+        raise WorkspaceDenied("Workspace policy path cannot be a symlink")
+    data = load_workspace_policy(target)
+    raw = data.get("workspaces", {}).get(key)
+    if not isinstance(raw, dict):
+        raise WorkspaceDenied(f"Unknown workspace: {key}")
+    root = Path(normalize_host_path(str(raw.get("root", ""))))
+    marker = root / ".git"
+    if not marker.is_file() or marker.is_symlink():
+        raise WorkspaceDenied("Only linked Git worktree workspaces can be removed through this tool")
+    del data["workspaces"][key]
+    data["version"] = 2
+    temp = target.with_name(f".{target.name}.tmp")
+    try:
+        temp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    except OSError as exc:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorkspaceDenied("Unable to save workspace policy") from exc
+    return {"removed": True, "workspace": key, "root": str(root), **workspace_profiles(target)}
 
 
 def _public_exec_section(value: Any) -> dict[str, Any]:

@@ -98,6 +98,18 @@ def action_policy_status() -> dict[str, Any]:
     return request("action_policy_status")
 
 
+def admin_terminal_status() -> dict[str, Any]:
+    return request("admin_terminal_status")
+
+
+def set_admin_terminal_enabled(enabled: bool, confirm: bool = False) -> dict[str, Any]:
+    return request("set_admin_terminal_enabled", enabled=enabled, confirm=confirm)
+
+
+def start_admin_terminal(command: str, cwd: str = "/", confirm: bool = False) -> dict[str, Any]:
+    return request("start_admin_terminal", command=command, cwd=cwd, confirm=confirm, timeout=15.0)
+
+
 def update_action_capabilities(
     service_enabled: bool | None = None,
     docker_enabled: bool | None = None,
@@ -199,6 +211,10 @@ def write_pdf(path: str, content: str) -> dict[str, Any]:
     return request("write_pdf", path=path, content=content)
 
 
+def install_staged_pdf(path: str, staging_id: str, expected_size: int, expected_sha256: str) -> dict[str, Any]:
+    return request("install_staged_pdf", path=path, staging_id=staging_id, expected_size=expected_size, expected_sha256=expected_sha256, timeout=30.0)
+
+
 def create_directory(path: str, parents: bool = True) -> dict[str, Any]:
     return request("create_directory", path=path, parents=parents)
 
@@ -269,6 +285,10 @@ def list_services(pattern: str = "*", max_results: int = 200) -> dict[str, Any]:
 
 def service_status(unit: str) -> dict[str, Any]:
     return request("service_status", unit=unit)
+
+
+def service_code_identity(unit: str) -> dict[str, Any]:
+    return request("service_code_identity", unit=unit)
 
 
 def systemd_failed_units(max_results: int = 200) -> dict[str, Any]:
@@ -354,8 +374,34 @@ def workspace_profiles() -> dict[str, Any]:
     return request("workspace_profiles")
 
 
+def dc_equivalence_self_test() -> dict[str, Any]:
+    return request("dc_equivalence_self_test", timeout=90.0)
+
+
+def workspace_discover_git_worktrees(base_workspace: str) -> dict[str, Any]:
+    return request("workspace_discover_git_worktrees", base_workspace=base_workspace)
+
+
+def workspace_remove(workspace: str, confirm: bool = False) -> dict[str, Any]:
+    return request("workspace_remove", workspace=workspace, confirm=confirm)
+
+
+def workspace_update(workspace: str, permissions: dict[str, Any] | None = None, features: dict[str, Any] | None = None, confirm: bool = False) -> dict[str, Any]:
+    return request("workspace_update", workspace=workspace, permissions=permissions, features=features, confirm=confirm)
+
+
 def set_workspace_http_ports(workspace: str, ports: list[int], confirm: bool = False) -> dict[str, Any]:
     return request("set_workspace_http_ports", workspace=workspace, ports=ports, confirm=confirm)
+
+
+def register_git_worktree_workspace(base_workspace: str, workspace: str, root: str, confirm: bool = False) -> dict[str, Any]:
+    return request(
+        "register_git_worktree_workspace",
+        base_workspace=base_workspace,
+        workspace=workspace,
+        root=root,
+        confirm=confirm,
+    )
 
 
 def start_workspace_python(workspace: str, script: str, args: list[str] | None = None) -> dict[str, Any]:
@@ -393,6 +439,27 @@ def start_managed_terminal(
         read_only_paths=read_only_paths or [],
         confirm=confirm,
     )
+
+
+def developer_access_status() -> dict[str, Any]:
+    return request("developer_access_status", timeout=10.0)
+
+
+def developer_access_configure(policy: dict[str, Any]) -> dict[str, Any]:
+    return request("developer_access_configure", timeout=10.0, policy=policy)
+
+
+def developer_access_authorize_sudo(sudo_password: str, ttl_minutes: int, confirm: bool = False) -> dict[str, Any]:
+    # The password travels only inside this request body on the node-local Unix socket.
+    return request("developer_access_authorize_sudo", timeout=40.0, sudo_password=sudo_password, ttl_minutes=ttl_minutes, confirm=confirm)
+
+
+def developer_access_revoke_sudo(reason: str = "revoked") -> dict[str, Any]:
+    return request("developer_access_revoke_sudo", timeout=30.0, reason=reason)
+
+
+def start_developer_terminal(command: str, cwd: str = "/", confirm: bool = False, privileged: bool = False) -> dict[str, Any]:
+    return request("start_developer_terminal", timeout=25.0, command=command, cwd=cwd, confirm=confirm, privileged=privileged)
 
 
 def start_workspace_pytest(workspace: str, targets: list[str] | None = None, args: list[str] | None = None) -> dict[str, Any]:
@@ -443,6 +510,10 @@ def git_branch_switch(path: str, name: str) -> dict[str, Any]:
     return request("git_branch_switch", path=path, name=name)
 
 
+def git_restore_paths(path: str, source_commit: str, paths: list[str], confirm: bool = False) -> dict[str, Any]:
+    return request("git_restore_paths", path=path, source_commit=source_commit, paths=paths, confirm=confirm)
+
+
 def git_reset_to_commit(path: str, target_commit: str, expected_head: str, confirm: bool = False) -> dict[str, Any]:
     return request("git_reset_to_commit", path=path, target_commit=target_commit, expected_head=expected_head, confirm=confirm)
 
@@ -461,3 +532,63 @@ def timer_status(unit: str) -> dict[str, Any]:
 
 def unit_file(unit: str) -> dict[str, Any]:
     return request("unit_file", unit=unit)
+
+
+def sap_profiles() -> dict[str, Any]:
+    return request("sap_profiles")
+
+
+def sap_profile_configure(name: str, base_url: str, client: str = "", username: str = "", password: str = "", bearer_token: str = "", verify_tls: bool = True, allow_insecure_http: bool = False, confirm: bool = False) -> dict[str, Any]:
+    return request("sap_profile_configure", name=name, base_url=base_url, client=client, username=username, password=password, bearer_token=bearer_token, verify_tls=verify_tls, allow_insecure_http=allow_insecure_http, confirm=confirm, timeout=30.0)
+
+
+def sap_profile_remove(name: str, confirm: bool = False) -> dict[str, Any]:
+    return request("sap_profile_remove", name=name, confirm=confirm)
+
+
+def sap_host_discover() -> dict[str, Any]:
+    return request("sap_host_discover", timeout=10.0)
+
+
+def sap_process_list(instance_number: str, host: str = "") -> dict[str, Any]:
+    return request("sap_process_list", instance_number=instance_number, host=host, timeout=30.0)
+
+
+def sap_system_info(instance_number: str, host: str = "") -> dict[str, Any]:
+    return request("sap_system_info", instance_number=instance_number, host=host, timeout=45.0)
+
+
+def sap_instance_action(instance_number: str, action: str, host: str = "", confirm: bool = False) -> dict[str, Any]:
+    return request("sap_instance_action", instance_number=instance_number, action=action, host=host, confirm=confirm, timeout=75.0)
+
+
+def sap_rfc_status() -> dict[str, Any]:
+    return request("sap_rfc_status")
+
+
+def abap_adt_get(profile: str, path: str, accept: str = "") -> dict[str, Any]:
+    return request("abap_adt_get", profile=profile, path=path, accept=accept, timeout=45.0)
+
+
+def abap_object_search(profile: str, query: str, object_type: str = "", max_results: int = 50) -> dict[str, Any]:
+    return request("abap_object_search", profile=profile, query=query, object_type=object_type, max_results=max_results, timeout=45.0)
+
+
+def abap_source_read(profile: str, source_uri: str) -> dict[str, Any]:
+    return request("abap_source_read", profile=profile, source_uri=source_uri, timeout=45.0)
+
+
+def abap_adt_change(profile: str, method: str, path: str, body: str = "", content_type: str = "application/xml; charset=utf-8", confirm: bool = False) -> dict[str, Any]:
+    return request("abap_adt_change", profile=profile, method=method, path=path, body=body, content_type=content_type, confirm=confirm, timeout=75.0)
+
+
+def abap_source_update(profile: str, source_uri: str, source: str, lock_handle: str = "", transport_request: str = "", confirm: bool = False) -> dict[str, Any]:
+    return request("abap_source_update", profile=profile, source_uri=source_uri, source=source, lock_handle=lock_handle, transport_request=transport_request, confirm=confirm, timeout=75.0)
+
+
+def abap_activate(profile: str, object_uri: str, object_name: str = "", confirm: bool = False) -> dict[str, Any]:
+    return request("abap_activate", profile=profile, object_uri=object_uri, object_name=object_name, confirm=confirm, timeout=75.0)
+
+
+def abap_atc_run(profile: str, path: str, body: str, confirm: bool = False) -> dict[str, Any]:
+    return request("abap_atc_run", profile=profile, path=path, body=body, confirm=confirm, timeout=120.0)

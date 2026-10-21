@@ -63,6 +63,7 @@ DENIED_PREFIXES = (
     f"{PROJECT_ROOT}/data/devices",
     f"{PROJECT_ROOT}/data/sessions",
     "/var/lib/joe-mcp-work/persistent-sessions",
+    "/var/lib/joe-mcp-work/sap",
 )
 
 SAFE_PROC_FILES = {

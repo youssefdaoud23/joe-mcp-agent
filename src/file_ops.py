@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,10 @@ MAX_TEXT_FILE_BYTES = int(os.getenv("JOE_MAX_TEXT_FILE_BYTES", "2097152"))
 MAX_COPY_BYTES = int(os.getenv("JOE_MAX_COPY_BYTES", str(100 * 1024 * 1024)))
 TRASH_ROOT = Path(os.getenv("JOE_TRASH_ROOT", "/var/lib/joe-mcp-work/trash"))
 TRASH_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+PDF_STAGE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+MAX_STAGED_PDF_BYTES = 50 * 1024 * 1024
+CONTROLLER_PDF_STAGE_ROOT = Path(os.getenv("JOE_CONTROLLER_PDF_STAGE_ROOT", "/var/lib/joe-mcp-work/controller-state/pdf-staging"))
+AGENT_PDF_STAGE_ROOT = Path(os.getenv("JOE_AGENT_PDF_STAGE_ROOT", "/var/lib/joe-mcp-agent/pdf-staging"))
 
 
 def _encoded(text: str) -> bytes:
@@ -136,6 +141,80 @@ def edit_file(path: str, old_text: str, new_text: str, expected_replacements: in
         "old_size": len(raw),
         "new_size": len(encoded),
     }
+
+
+def install_staged_pdf(
+    path: str,
+    staging_id: str,
+    expected_size: int,
+    expected_sha256: str,
+    *,
+    managed_node: bool = False,
+) -> dict[str, Any]:
+    if Path(str(path or "")).suffix.lower() != ".pdf":
+        raise ValueError("Staged PDF output path must end in .pdf")
+    token = str(staging_id or "").strip().lower()
+    if not PDF_STAGE_ID_RE.fullmatch(token):
+        raise ValueError("Invalid PDF staging id")
+    try:
+        size = int(expected_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid staged PDF size") from exc
+    if size <= 0 or size > MAX_STAGED_PDF_BYTES:
+        raise ValueError("Staged PDF size is outside allowed bounds")
+    digest = str(expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("Invalid staged PDF SHA-256")
+
+    stage_root = AGENT_PDF_STAGE_ROOT if managed_node else CONTROLLER_PDF_STAGE_ROOT
+    source = stage_root / f"{token}.pdf"
+    if not source.exists() or source.is_symlink() or not source.is_file():
+        raise FileNotFoundError("Staged PDF payload not found")
+    if source.parent.resolve(strict=False) != stage_root.resolve(strict=False):
+        raise ValueError("Staged PDF path escaped its fixed staging root")
+    if source.stat().st_size != size:
+        raise ValueError("Staged PDF size did not match request")
+
+    fd = _open_no_follow(source, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            data = handle.read(MAX_STAGED_PDF_BYTES + 1)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    if len(data) != size or len(data) > MAX_STAGED_PDF_BYTES:
+        raise ValueError("Staged PDF payload changed while being read")
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError("Staged PDF SHA-256 verification failed")
+    if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-4096:]:
+        raise ValueError("Staged payload does not look like a complete PDF")
+
+    target = safe_write_path(path, must_exist=False)
+    if not target.parent.exists() or not target.parent.is_dir():
+        raise FileNotFoundError(f"Destination parent does not exist: {target.parent}")
+    temp = target.parent / f".{target.name}.joe-pdf-{uuid.uuid4().hex}.tmp"
+    temp_fd = _open_no_follow(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(temp_fd, "wb", closefd=True) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temp, target, follow_symlinks=False)
+    except Exception:
+        try:
+            os.close(temp_fd)
+        except OSError:
+            pass
+        temp.unlink(missing_ok=True)
+        raise
+    finally:
+        temp.unlink(missing_ok=True)
+    if not managed_node:
+        source.unlink(missing_ok=True)
+    return {"path": path, "format": "pdf", "created": True, "bytes_written": len(data), "size": target.stat().st_size}
 
 
 def create_directory(path: str, parents: bool = True) -> dict[str, Any]:

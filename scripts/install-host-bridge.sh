@@ -86,8 +86,17 @@ escaped_root="${escaped_root//|/\|}"
 escaped_runtime="${RUNTIME_ROOT//\/\\}"
 escaped_runtime="${escaped_runtime//&/\&}"
 escaped_runtime="${escaped_runtime//|/\|}"
-sed "s|@PROJECT_ROOT@|$escaped_root|g" "$CLI_TEMPLATE" > "$CLI"
-chmod 0755 "$CLI"
+if [[ "${JOE_MANAGED_NODE:-0}" == "1" && ! -w "$(dirname "$CLI")" ]]; then
+  # Older managed-node updater sandboxes did not grant /usr/local/bin write access.
+  # Preserve the existing CLI for this bootstrap update; the newly installed updater
+  # unit includes /usr/local/bin so the next update can refresh it normally.
+  if [[ "${JOE_INSTALL_VERBOSE:-0}" == "1" ]]; then
+    echo "Preserving existing Joe CLI until the updater sandbox is refreshed."
+  fi
+else
+  sed "s|@PROJECT_ROOT@|$escaped_root|g" "$CLI_TEMPLATE" > "$CLI"
+  chmod 0755 "$CLI"
+fi
 if [[ "${JOE_MANAGED_NODE:-0}" != "1" ]]; then
   sed -e "s|@RUNTIME_ROOT@|$escaped_runtime|g" "$DEPLOY_RUNNER_TEMPLATE" > "$DEPLOY_RUNNER"
   chmod 0755 "$DEPLOY_RUNNER"
@@ -115,28 +124,54 @@ try:
     data = json.loads(policy_path.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as exc:
     raise SystemExit(f"Invalid Joe workspace policy: {exc}")
-if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("workspaces"), dict):
+if not isinstance(data, dict) or data.get("version") not in {1, 2} or not isinstance(data.get("workspaces"), dict):
     raise SystemExit("Invalid Joe workspace policy structure")
 
 write_paths: list[str] = []
 read_only_paths: list[str] = []
+workspace_roots: list[Path] = []
 for name, raw in data["workspaces"].items():
     if not isinstance(raw, dict):
         raise SystemExit(f"Invalid workspace profile: {name}")
-    permissions = raw.get("permissions", {})
-    if not isinstance(permissions, dict) or not permissions.get("modify", False):
-        continue
     root_raw = str(raw.get("root", ""))
     if not root_raw.startswith("/") or root_raw == "/" or any(ch in root_raw for ch in "\x00\r\n"):
         raise SystemExit(f"Unsafe workspace root in policy: {name}")
-    root = str(Path(root_raw).resolve(strict=False))
-    if root == project_root:
+    root_path = Path(root_raw).resolve(strict=False)
+    if root_path.is_dir():
+        workspace_roots.append(root_path)
+
+for name, raw in data["workspaces"].items():
+    permissions = raw.get("permissions", {})
+    if not isinstance(permissions, dict) or not permissions.get("modify", False):
         continue
-    if not Path(root).is_dir():
+    root = Path(str(raw.get("root", ""))).resolve(strict=False)
+    if str(root) == project_root or not root.is_dir():
         continue
-    write_paths.append(root)
-    for suffix in (".git/config", ".git/config.worktree", ".git/hooks", ".secrets", ".env"):
-        read_only_paths.append(f"-{root}/{suffix}")
+    write_paths.append(str(root))
+    read_only_paths.extend((f"-{root}/.secrets", f"-{root}/.env"))
+    marker = root / ".git"
+    if marker.is_dir() and not marker.is_symlink():
+        for suffix in ("config", "config.worktree", "hooks"):
+            read_only_paths.append(f"-{marker}/{suffix}")
+    elif marker.is_file() and not marker.is_symlink():
+        try:
+            line = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            line = ""
+        if line.startswith("gitdir: "):
+            git_dir = Path(line[8:].strip())
+            if not git_dir.is_absolute():
+                git_dir = (root / git_dir).resolve(strict=False)
+            else:
+                git_dir = git_dir.resolve(strict=False)
+            for base_root in workspace_roots:
+                common = base_root / ".git"
+                worktrees = common / "worktrees"
+                if common.is_dir() and git_dir.is_relative_to(worktrees):
+                    for suffix in ("config", "config.worktree", "hooks"):
+                        read_only_paths.append(f"-{common}/{suffix}")
+                    read_only_paths.append(f"-{git_dir}/config.worktree")
+                    break
 
 write_paths = list(dict.fromkeys(write_paths))
 read_only_paths = list(dict.fromkeys(read_only_paths))

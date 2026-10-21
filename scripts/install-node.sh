@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JOE_VERSION="0.33.0"
+JOE_VERSION="0.37.4"
 SERVER=""
 ENROLL=""
 NODE_NAME="$(hostname 2>/dev/null || echo managed-node)"
@@ -83,6 +83,22 @@ if ! python3 -c 'import xlrd' >/dev/null 2>&1; then
 fi
 if ! python3 -c 'import xlrd' >/dev/null 2>&1; then
   echo "Note: optional legacy .xls reading is unavailable on this node; XLSX/XLSM support is unaffected." >&2
+fi
+
+if ! python3 -c 'import pypdf' >/dev/null 2>&1; then
+  echo "Installing optional existing-PDF page operations..."
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends python3-pypdf || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3-pypdf || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y python3-pypdf || true
+  fi
+fi
+if ! python3 -c 'import pypdf' >/dev/null 2>&1; then
+  echo "Note: existing-PDF delete/insert/merge operations are unavailable on this node; new PDF creation is unaffected." >&2
 fi
 
 python3 - "$SERVER" <<'PYURL'
@@ -256,9 +272,11 @@ fi
 
 systemctl daemon-reload
 if [[ "$VERBOSE" -eq 1 ]]; then
-  systemctl enable --now joe-mcp-node-agent.service
+  systemctl enable joe-mcp-node-agent.service
+  systemctl restart joe-mcp-node-agent.service
 else
-  systemctl enable --now joe-mcp-node-agent.service >/dev/null 2>&1
+  systemctl enable joe-mcp-node-agent.service >/dev/null 2>&1
+  systemctl restart joe-mcp-node-agent.service >/dev/null 2>&1
 fi
 
 echo "[4/4] Verifying services and controller connection..."

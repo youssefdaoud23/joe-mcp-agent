@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
+import time
+from pathlib import Path
 from typing import Any
 
 from src.action_policy import authorize_service_action, authorize_systemd_unit_action
-from src.security import redact_text
+from src.git_ops import GitError, git_status
+from src.security import redact_argv, redact_text
 
 
 SYSTEMD_ENV = {
@@ -252,18 +256,151 @@ def unit_file(unit: str) -> dict[str, Any]:
     }
 
 
+SERVICE_IDENTITY_FILE = Path(os.getenv("JOE_SERVICE_IDENTITY_FILE", "/var/lib/joe-mcp-work/service-code-identity.json"))
+
+
+def _service_working_directory(unit: str) -> str | None:
+    try:
+        values = _show(unit, ("Id", "WorkingDirectory"))
+    except SystemdError:
+        return None
+    value = str(values.get("WorkingDirectory") or "").strip()
+    if not value or not value.startswith("/"):
+        return None
+    return str(Path(value).resolve(strict=False))
+
+
+def _git_identity_for_path(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    try:
+        status = git_status(path)
+    except (GitError, FileNotFoundError, PermissionError, ValueError, OSError):
+        return None
+    return {
+        "worktree": status.get("repository"),
+        "branch": status.get("branch"),
+        "head": status.get("head"),
+        "clean": status.get("clean"),
+        "worktree_matches_head": status.get("worktree_matches_head"),
+        "common_git_directory": status.get("common_git_directory"),
+        "worktree_kind": status.get("worktree_kind"),
+    }
+
+
+def _read_service_identity_state() -> dict[str, Any]:
+    try:
+        data = json.loads(SERVICE_IDENTITY_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"version": 1, "units": {}}
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "units": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("units"), dict):
+        return {"version": 1, "units": {}}
+    return data
+
+
+def _write_service_identity_state(data: dict[str, Any]) -> None:
+    SERVICE_IDENTITY_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = SERVICE_IDENTITY_FILE.with_name(f".{SERVICE_IDENTITY_FILE.name}.tmp")
+    temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    os.replace(temp, SERVICE_IDENTITY_FILE)
+
+
+def _snapshot_service_runtime(unit: str, expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    status = service_status(unit)
+    pid = int(status.get("main_pid") or 0)
+    cwd: str | None = None
+    executable: str | None = None
+    argv: list[str] = []
+    start_ticks: int | None = None
+    if pid > 0:
+        proc = Path("/proc") / str(pid)
+        try:
+            cwd = str((proc / "cwd").resolve(strict=True))
+        except OSError:
+            cwd = None
+        try:
+            executable = str((proc / "exe").resolve(strict=True))
+        except OSError:
+            executable = None
+        try:
+            raw = (proc / "cmdline").read_bytes()[:64_000]
+            argv = [item.decode("utf-8", errors="replace") for item in raw.split(b"\x00") if item][:32]
+        except OSError:
+            argv = []
+        try:
+            fields = (proc / "stat").read_text(encoding="utf-8", errors="replace").split()
+            start_ticks = int(fields[21]) if len(fields) > 21 else None
+        except (OSError, ValueError):
+            start_ticks = None
+    working_directory = cwd or _service_working_directory(unit)
+    actual_git = _git_identity_for_path(working_directory)
+    captured = expected or {}
+    runtime_commit = captured.get("head") if captured and actual_git and captured.get("worktree") == actual_git.get("worktree") else None
+    runtime_verified = bool(runtime_commit and actual_git and actual_git.get("head") == runtime_commit)
+    result = {
+        "unit": unit,
+        "pid": pid or None,
+        "process_start_time": status.get("active_enter_timestamp"),
+        "process_start_ticks": start_ticks,
+        "working_directory": working_directory,
+        "executable": executable,
+        "argv": redact_argv(argv) if argv else None,
+        "git_worktree": actual_git.get("worktree") if actual_git else None,
+        "git_branch": actual_git.get("branch") if actual_git else None,
+        "git_head": actual_git.get("head") if actual_git else None,
+        "git_clean": actual_git.get("clean") if actual_git else None,
+        "worktree_matches_head": actual_git.get("worktree_matches_head") if actual_git else None,
+        "common_git_directory": actual_git.get("common_git_directory") if actual_git else None,
+        "worktree_kind": actual_git.get("worktree_kind") if actual_git else None,
+        "runtime_commit": runtime_commit,
+        "runtime_commit_verified": runtime_verified,
+        "captured_at": time.time(),
+    }
+    return result
+
+
+def _record_service_runtime(unit: str, expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    identity = _snapshot_service_runtime(unit, expected)
+    data = _read_service_identity_state()
+    data["version"] = 1
+    data.setdefault("units", {})[unit] = identity
+    _write_service_identity_state(data)
+    return identity
+
+
+def service_code_identity(unit: str) -> dict[str, Any]:
+    normalized = normalize_unit(unit)
+    stored = _read_service_identity_state().get("units", {}).get(normalized, {})
+    current = _snapshot_service_runtime(normalized)
+    if isinstance(stored, dict):
+        same_process = bool(stored.get("pid") and stored.get("pid") == current.get("pid") and stored.get("process_start_ticks") == current.get("process_start_ticks"))
+        if same_process:
+            current["runtime_commit"] = stored.get("runtime_commit") or stored.get("git_head")
+            current["runtime_commit_verified"] = bool(current.get("runtime_commit") and current.get("git_head") == current.get("runtime_commit"))
+            current["runtime_snapshot_at"] = stored.get("captured_at")
+    return current
+
+
 def service_action(unit: str, action: str) -> dict[str, Any]:
     normalized = normalize_unit(unit)
     normalized_action = str(action or "").strip().lower()
     authorize_service_action(normalized, normalized_action)
     before = service_status(normalized)
+    expected_runtime = _git_identity_for_path(_service_working_directory(normalized)) if normalized_action in {"start", "restart"} else None
     _run([normalized_action, normalized], timeout=30.0, max_bytes=4_000)
     after = service_status(normalized)
+    identity = _record_service_runtime(normalized, expected_runtime) if expected_runtime and normalized_action in {"start", "restart"} and after.get("active_state") == "active" else None
+    if expected_runtime and identity and not identity.get("runtime_commit_verified"):
+        raise SystemdError("Service started but runtime Git identity does not match the commit captured before launch")
     return {
         "unit": normalized,
         "action": normalized_action,
         "before": {"active_state": before.get("active_state"), "sub_state": before.get("sub_state"), "main_pid": before.get("main_pid")},
         "after": {"active_state": after.get("active_state"), "sub_state": after.get("sub_state"), "main_pid": after.get("main_pid")},
+        "code_identity": identity,
     }
 
 
@@ -274,6 +411,7 @@ def unit_action(unit: str, action: str, confirm: bool = False) -> dict[str, Any]
     if normalized_action in {"enable", "disable", "enable_now", "disable_now"} and confirm is not True:
         raise SystemdError("Changing systemd enablement requires confirm=true")
     before = service_status(normalized) if normalized.endswith(".service") else timer_status(normalized)
+    expected_runtime = _git_identity_for_path(_service_working_directory(normalized)) if normalized.endswith(".service") and normalized_action in {"start", "restart", "enable_now"} else None
     if normalized_action == "enable_now":
         command = ["enable", "--now", normalized]
     elif normalized_action == "disable_now":
@@ -282,12 +420,16 @@ def unit_action(unit: str, action: str, confirm: bool = False) -> dict[str, Any]
         command = [normalized_action, normalized]
     _run(command, timeout=30.0, max_bytes=4_000)
     after = service_status(normalized) if normalized.endswith(".service") else timer_status(normalized)
+    identity = _record_service_runtime(normalized, expected_runtime) if expected_runtime and normalized.endswith(".service") and normalized_action in {"start", "restart", "enable_now"} and after.get("active_state") == "active" else None
+    if expected_runtime and identity and not identity.get("runtime_commit_verified"):
+        raise SystemdError("Service started but runtime Git identity does not match the commit captured before launch")
     fields = ("active_state", "sub_state", "unit_file_state")
     return {
         "unit": normalized,
         "action": normalized_action,
         "before": {key: before.get(key) for key in fields},
         "after": {key: after.get(key) for key in fields},
+        "code_identity": identity,
     }
 
 

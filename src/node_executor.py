@@ -3,11 +3,17 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from src.bridge_client import (
     create_directory as bridge_create_directory,
+    developer_access_authorize_sudo as bridge_developer_access_authorize_sudo,
+    developer_access_configure as bridge_developer_access_configure,
+    developer_access_revoke_sudo as bridge_developer_access_revoke_sudo,
+    developer_access_status as bridge_developer_access_status,
+    start_developer_terminal as bridge_start_developer_terminal,
     copy_file as bridge_copy_file,
     ping as bridge_ping,
     docker_action as bridge_docker_action,
@@ -26,6 +32,7 @@ from src.bridge_client import (
     git_branch_create as bridge_git_branch_create,
     git_branch_switch as bridge_git_branch_switch,
     git_push as bridge_git_push,
+    git_restore_paths as bridge_git_restore_paths,
     git_stage as bridge_git_stage,
     git_status as bridge_git_status,
     interact_with_process as bridge_interact_with_process,
@@ -46,10 +53,26 @@ from src.bridge_client import (
     list_services as bridge_list_services,
     list_sessions as bridge_list_sessions,
     workspace_profiles as bridge_workspace_profiles,
+    workspace_discover_git_worktrees as bridge_workspace_discover_git_worktrees,
     sqlite_tables as bridge_sqlite_tables,
     sqlite_schema as bridge_sqlite_schema,
     sqlite_query as bridge_sqlite_query,
     sqlite_table_stats as bridge_sqlite_table_stats,
+    sap_profiles as bridge_sap_profiles,
+    sap_profile_configure as bridge_sap_profile_configure,
+    sap_profile_remove as bridge_sap_profile_remove,
+    sap_host_discover as bridge_sap_host_discover,
+    sap_process_list as bridge_sap_process_list,
+    sap_system_info as bridge_sap_system_info,
+    sap_instance_action as bridge_sap_instance_action,
+    sap_rfc_status as bridge_sap_rfc_status,
+    abap_adt_get as bridge_abap_adt_get,
+    abap_object_search as bridge_abap_object_search,
+    abap_source_read as bridge_abap_source_read,
+    abap_adt_change as bridge_abap_adt_change,
+    abap_source_update as bridge_abap_source_update,
+    abap_activate as bridge_abap_activate,
+    abap_atc_run as bridge_abap_atc_run,
     localhost_http as bridge_localhost_http,
     move_file as bridge_move_file,
     trash_path as bridge_trash_path,
@@ -59,6 +82,7 @@ from src.bridge_client import (
     read_process_output as bridge_read_process_output,
     service_action as bridge_service_action,
     unit_action as bridge_unit_action,
+    service_code_identity as bridge_service_code_identity,
     service_status as bridge_service_status,
     start_process as bridge_start_process,
     start_workspace_node_check as bridge_start_workspace_node_check,
@@ -69,9 +93,11 @@ from src.bridge_client import (
     start_workspace_pytest as bridge_start_workspace_pytest,
     write_file as bridge_write_file,
     write_pdf as bridge_write_pdf,
+    install_staged_pdf as bridge_install_staged_pdf,
 )
 from src.lifecycle_bridge import git_restore_previous as bridge_git_restore_previous, git_restore_to_commit as bridge_git_restore_to_commit
 from src.deployment_ops import deployment_preflight_data, deployment_restore_previous_data, deployment_verify_data
+from src.developer_access import DeveloperAccessDenied, default_policy as developer_default_policy, normalize_policy as developer_normalize_policy, public_status as developer_public_status
 from src.file_inspect import directory_tree as inspect_directory_tree, inspect_file
 from src.filesystem_scope import (
     FULL_HOST_MODE,
@@ -82,13 +108,14 @@ from src.filesystem_scope import (
 )
 from src.managed_terminal import discover_scope_protections, profiles_info as managed_terminal_profiles_info
 from src.rich_file import read_multiple_rich_files, read_rich_file, rich_file_info
+from src.pdf_ops import build_modified_pdf, stage_pdf_bytes
 from src.url_read import http_probe as safe_http_probe, read_url
 from src.process_ops import list_open_ports as inspect_open_ports, list_processes as inspect_processes, process_info as inspect_process_info, process_memory_info as inspect_process_memory_info
 from src.read_tools import read_multiple_text_files, read_text_page
-from src.remote_protocol import ALL_REMOTE_TOOLS, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES
+from src.remote_protocol import ALL_REMOTE_TOOLS, MAX_RESULT_BYTES, max_argument_bytes_for_tool
 from src.search_sessions import SearchManager
 from src.search_tools import search_content as bounded_search_content, search_files as bounded_search_files
-from src.security import is_host_path_allowed, redact_argv, safe_host_path
+from src.security import is_host_path_allowed, normalize_host_path, redact_argv, safe_host_path
 
 
 class NodeExecutionError(RuntimeError):
@@ -99,9 +126,11 @@ class NodeExecutor:
     def __init__(self, host_root: Path | None = None) -> None:
         self.host_root = host_root or Path(os.getenv("JOE_HOST_ROOT", "/host"))
         self.node_name = os.getenv("JOE_NODE_NAME", "managed-node")
-        self.version = os.getenv("JOE_VERSION", "0.33.0")
+        self.version = os.getenv("JOE_VERSION", "0.37.4")
         self.mode = os.getenv("JOE_MODE", "guarded")
         self.filesystem_policy = default_filesystem_policy()
+        self._developer_applied: dict[str, Any] | None = None
+        self._developer_retry_at = 0.0
         self.searches = SearchManager(self.host_root)
         self._tools: dict[str, Callable[..., dict[str, Any]]] = {
             "server_info": self.server_info,
@@ -140,6 +169,7 @@ class NodeExecutor:
             "git_merge_branches": bridge_git_merge_branches,
             "git_restore_to_commit": bridge_git_restore_to_commit,
             "git_restore_previous": bridge_git_restore_previous,
+            "git_restore_paths": bridge_git_restore_paths,
             "git_stage": bridge_git_stage,
             "git_commit": bridge_git_commit,
             "git_push": bridge_git_push,
@@ -148,6 +178,7 @@ class NodeExecutor:
             "timer_status": bridge_timer_status,
             "unit_file": bridge_unit_file,
             "service_status": bridge_service_status,
+            "service_code_identity": bridge_service_code_identity,
             "systemd_failed_units": bridge_systemd_failed_units,
             "service_action": bridge_service_action,
             "unit_action": bridge_unit_action,
@@ -168,6 +199,8 @@ class NodeExecutor:
             "start_workspace_python_code": bridge_start_workspace_python_code,
             "start_workspace_shell": bridge_start_workspace_shell,
             "start_managed_terminal": self.start_managed_terminal,
+            "start_developer_terminal": self.start_developer_terminal,
+            "developer_access_status": self.developer_access_status,
             "start_workspace_node_check": bridge_start_workspace_node_check,
             "start_workspace_pytest": bridge_start_workspace_pytest,
             "read_process_output": bridge_read_process_output,
@@ -189,10 +222,26 @@ class NodeExecutor:
             "purge_trash": bridge_purge_trash,
             "list_sessions": bridge_list_sessions,
             "workspace_profiles": self.workspace_profiles,
+            "workspace_discover_git_worktrees": bridge_workspace_discover_git_worktrees,
             "sqlite_tables": bridge_sqlite_tables,
             "sqlite_schema": bridge_sqlite_schema,
             "sqlite_query": bridge_sqlite_query,
             "sqlite_table_stats": bridge_sqlite_table_stats,
+            "sap_profiles": bridge_sap_profiles,
+            "sap_profile_configure": bridge_sap_profile_configure,
+            "sap_profile_remove": bridge_sap_profile_remove,
+            "sap_host_discover": bridge_sap_host_discover,
+            "sap_process_list": bridge_sap_process_list,
+            "sap_system_info": bridge_sap_system_info,
+            "sap_instance_action": bridge_sap_instance_action,
+            "sap_rfc_status": bridge_sap_rfc_status,
+            "abap_adt_get": bridge_abap_adt_get,
+            "abap_object_search": bridge_abap_object_search,
+            "abap_source_read": bridge_abap_source_read,
+            "abap_adt_change": bridge_abap_adt_change,
+            "abap_source_update": bridge_abap_source_update,
+            "abap_activate": bridge_abap_activate,
+            "abap_atc_run": bridge_abap_atc_run,
             "localhost_http": bridge_localhost_http,
             "deployment_preflight": deployment_preflight_data,
             "deployment_verify": deployment_verify_data,
@@ -205,9 +254,17 @@ class NodeExecutor:
 
     def set_filesystem_policy(self, policy: dict[str, Any] | None) -> dict[str, Any]:
         normalized = normalize_filesystem_policy(policy)
+        was_restricted = self._restricted()
         if normalized != self.filesystem_policy:
             self.searches = SearchManager(self.host_root)
         self.filesystem_policy = normalized
+        if self._restricted() and not was_restricted:
+            # Developer Access is unavailable under a restricted filesystem scope; end any sudo ticket now.
+            self._developer_applied = None
+            try:
+                bridge_developer_access_revoke_sudo("restricted_scope")
+            except Exception:
+                pass
         return normalized
 
     def _restricted(self) -> bool:
@@ -317,6 +374,97 @@ class NodeExecutor:
             True,
         )
 
+    def start_developer_terminal(
+        self,
+        command: str,
+        cwd: str = "/",
+        confirm: bool = False,
+        privileged: bool = False,
+    ) -> dict[str, Any]:
+        # The only inputs are the command, its directory and two flags. The policy (enabled / Linux user /
+        # sudo allowed) is read from the node's own root-owned state by the host bridge, never from here.
+        if self._restricted():
+            raise NodeExecutionError("Developer Access is unavailable while device filesystem scope is restricted")
+        if confirm is not True:
+            raise NodeExecutionError("Developer terminal execution requires confirm=true")
+        if not isinstance(privileged, bool):
+            raise NodeExecutionError("privileged must be true or false")
+        return bridge_start_developer_terminal(command, cwd, True, privileged)
+
+    def developer_access_status(self) -> dict[str, Any]:
+        if self._restricted():
+            return developer_public_status(
+                developer_default_policy(), None, available=False,
+                reason="unavailable while device filesystem scope is restricted",
+            )
+        return bridge_developer_access_status()
+
+    # --- Developer Access control plane: reachable only from node_agent lifecycle jobs, never via execute() ---
+
+    def developer_access_configure(self, policy: Any) -> dict[str, Any]:
+        try:
+            normalized = developer_normalize_policy(policy)
+        except DeveloperAccessDenied as exc:
+            raise NodeExecutionError(str(exc)) from exc
+        if self._restricted() and normalized["enabled"]:
+            raise NodeExecutionError("Developer Access cannot be enabled while device filesystem scope is restricted")
+        try:
+            result = bridge_developer_access_configure(normalized)
+        except Exception as exc:
+            raise NodeExecutionError(str(exc)) from exc
+        self._developer_applied = normalized
+        return result
+
+    def developer_access_authorize_sudo(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self._restricted():
+            raise NodeExecutionError("Developer Access is unavailable while device filesystem scope is restricted")
+        password = arguments.pop("sudo_password", None) if isinstance(arguments, dict) else None
+        try:
+            return bridge_developer_access_authorize_sudo(
+                password, (arguments or {}).get("ttl_minutes"), (arguments or {}).get("confirm") is True,
+            )
+        except Exception as exc:
+            raise NodeExecutionError(str(exc)) from exc
+        finally:
+            password = None
+
+    def developer_access_revoke_sudo(self, reason: str = "revoked") -> dict[str, Any]:
+        try:
+            return bridge_developer_access_revoke_sudo(str(reason or "revoked")[:32])
+        except Exception as exc:
+            raise NodeExecutionError(str(exc)) from exc
+
+    def sync_developer_access(self, policy: Any) -> None:
+        """Reconcile the controller's effective policy (sent on every poll) into the node's own state.
+
+        Fail closed: an invalid policy, a restricted filesystem scope, or an account that cannot be
+        resolved on this node leaves Developer Access disabled.
+        """
+        if policy is None:
+            return
+        try:
+            desired = developer_normalize_policy(policy)
+        except DeveloperAccessDenied:
+            desired = developer_default_policy()
+        if self._restricted() and desired["enabled"]:
+            desired = {**desired, "enabled": False}
+        if desired == self._developer_applied:
+            return
+        if time.time() < self._developer_retry_at:
+            return
+        try:
+            bridge_developer_access_configure(desired)
+        except Exception:
+            # Could not apply (for example the Linux user does not exist here): stay disabled, retry later.
+            self._developer_retry_at = time.time() + 300
+            try:
+                bridge_developer_access_configure(developer_default_policy())
+            except Exception:
+                pass
+            return
+        self._developer_retry_at = 0.0
+        self._developer_applied = desired
+
     def _enforce_filesystem_scope(self, tool: str, arguments: dict[str, Any]) -> None:
         if not self._restricted():
             return
@@ -330,7 +478,7 @@ class NodeExecutor:
         git_read_tools = {"git_status", "git_diff", "git_log", "git_branches"}
         git_write_tools = {
             "git_stage", "git_commit", "git_push", "git_branch_create", "git_branch_switch",
-            "git_restore_to_commit", "git_restore_previous",
+            "git_restore_to_commit", "git_restore_previous", "git_restore_paths", "git_merge_branches",
         }
         workspace_read_tools = {
             "sqlite_tables", "sqlite_schema", "sqlite_query", "sqlite_table_stats", "localhost_http",
@@ -339,19 +487,23 @@ class NodeExecutor:
         workspace_write_tools = {"deployment_restore_previous"}
         restricted_code_tools = {
             "start_workspace_python", "start_workspace_python_code", "start_workspace_shell", "start_workspace_pytest",
-            "start_managed_terminal",
+            "start_managed_terminal", "start_developer_terminal",
         }
         restricted_session_tools = {
             "start_process", "read_process_output", "interact_with_process", "kill_process", "force_terminate", "terminate_host_process",
             "list_sessions", "list_processes", "process_info", "list_open_ports",
         }
         restricted_global_tools = {
-            "list_services", "service_status", "systemd_failed_units", "service_action", "unit_action", "list_timers", "timer_status", "unit_file", "journal_logs", "journal_diagnostics", "kernel_diagnostics", "firewall_status", "tailscale_status", "sysctl_read", "proc_snapshot", "routing_diagnostics",
+            "list_services", "service_status", "service_code_identity", "systemd_failed_units", "service_action", "unit_action", "list_timers", "timer_status", "unit_file", "journal_logs", "journal_diagnostics", "kernel_diagnostics", "firewall_status", "tailscale_status", "sysctl_read", "proc_snapshot", "routing_diagnostics",
+            "workspace_discover_git_worktrees",
             "docker_containers", "docker_container_status", "docker_action", "docker_logs",
+            "sap_host_discover", "sap_process_list", "sap_system_info", "sap_instance_action",
         }
         safe_nonfilesystem_tools = {
             "server_info", "node_policy", "get_config", "managed_update_status", "host_info", "read_url", "http_probe",
-            "get_search_results", "list_searches", "stop_search", "workspace_profiles",
+            "developer_access_status", "get_search_results", "list_searches", "stop_search", "workspace_profiles",
+            "sap_profiles", "sap_profile_configure", "sap_profile_remove", "sap_rfc_status",
+            "abap_adt_get", "abap_object_search", "abap_source_read", "abap_adt_change", "abap_source_update", "abap_activate", "abap_atc_run",
         }
         if tool in restricted_code_tools:
             raise NodeExecutionError("Arbitrary code and terminal execution are disabled while device filesystem scope is restricted")
@@ -382,8 +534,17 @@ class NodeExecutor:
                 self._require_path(str(path), write=False)
             return
         if tool in write_path_tools:
-            target_path = str(arguments.get("outputPath") or arguments.get("path") or "") if tool == "write_pdf" else str(arguments.get("path") or "")
-            self._require_path(target_path, write=True)
+            if tool == "write_pdf":
+                content = arguments.get("content")
+                target_path = str(arguments.get("outputPath") or arguments.get("path") or "")
+                if isinstance(content, list):
+                    self._require_path(str(arguments.get("path") or ""), write=False)
+                    for operation in content:
+                        if isinstance(operation, dict) and str(operation.get("sourcePdfPath") or "").strip():
+                            self._require_path(str(operation.get("sourcePdfPath")), write=False)
+                self._require_path(target_path, write=True)
+            else:
+                self._require_path(str(arguments.get("path") or ""), write=True)
             return
         if tool == "edit_block":
             self._require_path(str(arguments.get("file_path") or ""), write=True)
@@ -421,7 +582,7 @@ class NodeExecutor:
             raise NodeExecutionError("Remote tool is not supported")
         if not isinstance(arguments, dict):
             raise NodeExecutionError("Remote tool arguments must be an object")
-        if self._json_size(arguments) > MAX_ARGUMENT_BYTES:
+        if self._json_size(arguments) > max_argument_bytes_for_tool(name):
             raise NodeExecutionError("Remote tool arguments exceed size limit")
         self._enforce_filesystem_scope(name, arguments)
         target = self._tools[name]
@@ -447,10 +608,14 @@ class NodeExecutor:
         return {
             "name": "Joe MCP Server",
             "version": self.version,
+            "server_version": self.version,
+            "catalog_version": 41,
+            "capabilities_version": "2026-10-13-linked-worktree-admin-v1",
             "node": self.node_name,
             "mode": self.mode,
             "host_root": str(self.host_root),
             "remote_agent": True,
+            "refresh_required": False,
         }
 
     def _managed_terminal_policy(self) -> dict[str, Any]:
@@ -658,11 +823,24 @@ class NodeExecutor:
         return safe_http_probe(url, method, timeout_seconds, max_bytes)
 
     def write_pdf(self, path: str, content: Any, outputPath: str = "", options: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not isinstance(content, str):
-            raise ValueError("Existing-PDF insert/delete/sourcePdf operations are not supported yet")
-        result = bridge_write_pdf(str(outputPath or path), content)
-        result["options_applied"] = False if options else None
-        return result
+        if isinstance(content, str):
+            result = bridge_write_pdf(str(outputPath or path), content)
+            result["options_applied"] = False if options else None
+            return result
+        if not isinstance(content, list):
+            raise ValueError("PDF content must be markdown text or an existing-PDF operations array")
+        if not outputPath:
+            raise ValueError("Existing-PDF operations require outputPath so the original PDF is preserved")
+        if normalize_host_path(path) == normalize_host_path(outputPath):
+            raise ValueError("Existing-PDF operations cannot overwrite the source PDF")
+        data, details = build_modified_pdf(path, content, self.host_root)
+        stage_root = Path(os.getenv("JOE_AGENT_PDF_STAGE_ROOT", "/var/lib/joe-mcp-agent/pdf-staging"))
+        staged = stage_pdf_bytes(data, stage_root)
+        try:
+            installed = bridge_install_staged_pdf(outputPath, str(staged["token"]), int(staged["size"]), str(staged["sha256"]))
+        finally:
+            Path(staged["path"]).unlink(missing_ok=True)
+        return installed | details | {"path": outputPath, "source_path": path, "source_preserved": True, "options_applied": False if options else None}
 
     def edit_block(
         self,

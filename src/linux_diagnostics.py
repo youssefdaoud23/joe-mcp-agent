@@ -63,6 +63,42 @@ def _run(binary: str, args: list[str], timeout: float = 8.0, max_bytes: int = MA
     }
 
 
+def _run_json_document(binary: str, args: list[str], timeout: float = 8.0, max_bytes: int = MAX_BYTES, allow_nonzero: bool = False) -> dict[str, Any]:
+    """Run one fixed diagnostic command and parse bounded JSON before any text redaction.
+
+    The parsed document is for internal sanitization only and must never be returned directly.
+    """
+    executable = shutil.which(binary)
+    if not executable:
+        return {"available": False, "command": binary, "returncode": None, "data": None, "error": None}
+    try:
+        completed = subprocess.run(
+            [executable, *args], env=SAFE_ENV, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LinuxDiagnosticError(f"{binary} diagnostic timed out") from exc
+    raw_err = completed.stderr[:64_000]
+    error = redact_text(raw_err.decode("utf-8", errors="replace"), max_chars=8000) if raw_err else ""
+    if completed.returncode != 0:
+        if not allow_nonzero:
+            raise LinuxDiagnosticError(error.strip() or f"{binary} exited with status {completed.returncode}")
+        return {
+            "available": True, "command": binary, "returncode": int(completed.returncode),
+            "data": None, "error": error,
+        }
+    if len(completed.stdout) > max_bytes:
+        raise LinuxDiagnosticError(f"{binary} JSON diagnostic exceeded {max_bytes} byte limit")
+    try:
+        data = json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LinuxDiagnosticError(f"{binary} returned invalid JSON") from exc
+    return {
+        "available": True, "command": binary, "returncode": int(completed.returncode),
+        "data": data, "error": error,
+    }
+
+
 def firewall_status() -> dict[str, Any]:
     ufw = _run("ufw", ["status", "verbose"], timeout=8.0, max_bytes=250_000, allow_nonzero=True)
     nft = _run("nft", ["-j", "list", "ruleset"], timeout=10.0, max_bytes=500_000, allow_nonzero=True)
@@ -89,13 +125,12 @@ def firewall_status() -> dict[str, Any]:
 
 
 def tailscale_status() -> dict[str, Any]:
-    result = _run("tailscale", ["status", "--json"], timeout=8.0, max_bytes=750_000, allow_nonzero=True)
+    result = _run_json_document("tailscale", ["status", "--json"], timeout=8.0, max_bytes=750_000, allow_nonzero=True)
     if not result.get("available") or result.get("returncode") != 0:
-        return {"available": bool(result.get("available")), "returncode": result.get("returncode"), "error": result.get("stderr") or None, "read_only": True}
-    try:
-        data = json.loads(str(result.get("output") or "{}"))
-    except json.JSONDecodeError as exc:
-        raise LinuxDiagnosticError("tailscale returned invalid JSON") from exc
+        return {"available": bool(result.get("available")), "returncode": result.get("returncode"), "error": result.get("error") or None, "read_only": True}
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise LinuxDiagnosticError("tailscale returned a non-object JSON document")
     def peer(row: Any) -> dict[str, Any]:
         item = row if isinstance(row, dict) else {}
         return {

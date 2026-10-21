@@ -14,9 +14,20 @@ from pathlib import Path
 from typing import Any
 
 from src.node_executor import NodeExecutor
-from src.remote_protocol import ACTION_REMOTE_TOOLS, ALL_REMOTE_TOOLS, LIFECYCLE_SHUTDOWN_AGENT, LIFECYCLE_UPDATE_AGENT, PROTOCOL_VERSION, READ_REMOTE_TOOLS
+from src.remote_protocol import (
+    ACTION_REMOTE_TOOLS,
+    ALL_REMOTE_TOOLS,
+    DEVELOPER_ACCESS_PROTOCOL_VERSION,
+    LIFECYCLE_DEVELOPER_ACCESS_AUTHORIZE_SUDO,
+    LIFECYCLE_DEVELOPER_ACCESS_CONFIGURE,
+    LIFECYCLE_DEVELOPER_ACCESS_REVOKE_SUDO,
+    LIFECYCLE_SHUTDOWN_AGENT,
+    LIFECYCLE_UPDATE_AGENT,
+    PROTOCOL_VERSION,
+    READ_REMOTE_TOOLS,
+)
 
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.4"
 LIFECYCLE_ROTATE_TOKEN = "__rotate_device_token__"
 UPDATE_SERVICE = "joe-mcp-node-update.service"
 AGENT_SERVICE = "joe-mcp-node-agent.service"
@@ -54,9 +65,10 @@ def _metadata(name: str) -> dict[str, Any]:
         "os": platform.platform(),
         "architecture": platform.machine(),
         "agent_version": AGENT_VERSION,
-        "software_version": os.getenv("JOE_VERSION", "0.33.0"),
+        "software_version": os.getenv("JOE_VERSION", "0.37.4"),
         "routing_version": str(PROTOCOL_VERSION),
         "filesystem_scope_version": "1",
+        "developer_access_version": DEVELOPER_ACCESS_PROTOCOL_VERSION,
         "remote_tools": len(ALL_REMOTE_TOOLS),
         "update_lifecycle": True,
         "shutdown_lifecycle": True,
@@ -153,6 +165,14 @@ def _submit_result(server: str, token: str, job_id: str, result: dict[str, Any] 
     _post(server, "/api/device/result", token, payload, timeout=20)
 
 
+def _clear_developer_access_after_revocation(executor: NodeExecutor) -> None:
+    """The controller no longer accepts this device's credential: end any temporary sudo authorization."""
+    try:
+        executor.developer_access_revoke_sudo("device_revoked")
+    except Exception:
+        pass
+
+
 def _report_offline(cfg: dict[str, str], reason: str = "agent_shutdown") -> None:
     try:
         _post(cfg["server"], "/api/device/offline", cfg["token"], {"reason": reason}, timeout=8)
@@ -167,6 +187,11 @@ def run() -> None:
     cfg = _load_config()
     executor = NodeExecutor()
     failures = 0
+    # An agent (re)start always invalidates temporary sudo authorization held by the host bridge.
+    try:
+        executor.developer_access_revoke_sudo("agent_start")
+    except Exception:
+        pass
     for wanted_signal in (signal.SIGTERM, signal.SIGINT):
         signal.signal(wanted_signal, _handle_stop_signal)
     print(
@@ -187,6 +212,10 @@ def run() -> None:
                 )
                 failures = 0
                 executor.set_filesystem_policy(response.get("filesystem_policy"))
+                try:
+                    executor.sync_developer_access(response.get("developer_access"))
+                except Exception as exc:
+                    print(f"developer access policy sync failed closed: {type(exc).__name__}", file=sys.stderr, flush=True)
                 job = response.get("job")
                 if not isinstance(job, dict):
                     continue
@@ -221,6 +250,16 @@ def run() -> None:
                         shutdown_after_result = True
                     elif tool == LIFECYCLE_UPDATE_AGENT:
                         result = _trigger_managed_update(cfg["device_id"])
+                    elif tool == LIFECYCLE_DEVELOPER_ACCESS_CONFIGURE:
+                        result = executor.developer_access_configure(arguments.get("policy"))
+                    elif tool == LIFECYCLE_DEVELOPER_ACCESS_AUTHORIZE_SUDO:
+                        try:
+                            result = executor.developer_access_authorize_sudo(arguments)
+                        finally:
+                            arguments.pop("sudo_password", None)
+                            job.pop("arguments", None)
+                    elif tool == LIFECYCLE_DEVELOPER_ACCESS_REVOKE_SUDO:
+                        result = executor.developer_access_revoke_sudo(str(arguments.get("reason") or "revoked"))
                     elif tool in ALL_REMOTE_TOOLS:
                         result = executor.execute(tool, arguments)
                     else:
@@ -235,6 +274,8 @@ def run() -> None:
                         return
             except Exception as exc:
                 failures += 1
+                if "revoked device token" in str(exc).lower():
+                    _clear_developer_access_after_revocation(executor)
                 if _STOP_REQUESTED:
                     break
                 delay = min(30.0, 2.0 + failures * 2.0) + random.random()

@@ -304,11 +304,10 @@ def _wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def create_pdf(path: str, markdown: str) -> dict[str, Any]:
+def create_pdf_bytes(markdown: str) -> tuple[bytes, int]:
     source = str(markdown or "")
     if len(source) > MAX_PDF_SOURCE_CHARS:
         raise ValueError("PDF source exceeds bounded input limit")
-    target = safe_write_path(path)
     page_marker = '<div style="page-break-before: always;"></div>'
     source_pages = source.split(page_marker)
     pages: list[list[tuple[int, str]]] = []
@@ -360,5 +359,15 @@ def create_pdf(path: str, markdown: str) -> dict[str, Any]:
     xref = len(output); output.extend(f"xref\n0 {len(objects)+1}\n".encode("ascii")); output.extend(b"0000000000 65535 f \n")
     for offset in offsets[1:]: output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
     output.extend(f"trailer\n<< /Size {len(objects)+1} /Root {catalog_id} 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
-    existed = target.exists(); _atomic_bytes(target, bytes(output))
-    return {"path": path, "format": "pdf", "created": not existed, "pages": len(page_ids), "bytes_written": len(output), "size": target.stat().st_size, "renderer": "joe-basic-markdown"}
+    data = bytes(output)
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise ValueError("Generated PDF exceeds size limit")
+    return data, len(page_ids)
+
+
+def create_pdf(path: str, markdown: str) -> dict[str, Any]:
+    target = safe_write_path(path)
+    data, page_count = create_pdf_bytes(markdown)
+    existed = target.exists()
+    _atomic_bytes(target, data)
+    return {"path": path, "format": "pdf", "created": not existed, "pages": page_count, "bytes_written": len(data), "size": target.stat().st_size, "renderer": "joe-basic-markdown"}
