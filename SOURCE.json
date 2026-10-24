@@ -5,6 +5,6 @@
   "managed_runtime_files": 56,
   "name": "joe-mcp-node-python",
   "schema_version": 1,
-  "source_commit": "0d8af3d6e98495ee920602fc4c450184e9351d66",
+  "source_commit": "c37e10aeb5c407107294a80a65fe445c7427b9bc",
   "source_private_repository": "joe-mcp-server-python"
 }
