@@ -10,7 +10,7 @@ class WriteDenied(PermissionError):
     """Raised when a path is outside Joe MCP's writable policy."""
 
 
-PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp-server").rstrip("/") or "/opt/joe-mcp-server"
+PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp/python/current").rstrip("/") or "/opt/joe-mcp/python/current"
 DEFAULT_WRITE_ROOTS = (PROJECT_ROOT, "/var/lib/joe-mcp-work")
 PROTECTED_PREFIXES = (
     f"{PROJECT_ROOT}/.git", f"{PROJECT_ROOT}/.secrets", f"{PROJECT_ROOT}/data/auth",

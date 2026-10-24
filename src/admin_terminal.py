@@ -76,10 +76,10 @@ def validate_request(command: str, cwd: str, confirm: bool = False) -> tuple[str
         "/var/lib/joe-mcp-work/.secrets",
         "/var/lib/joe-mcp-work/sap",
         "/var/lib/joe-mcp-agent",
-        "/opt/joe-mcp-server/.secrets",
-        "/opt/joe-mcp-server/data/auth",
-        "/opt/joe-mcp-server/data/devices",
-        "/opt/joe-mcp-server/data/sessions",
+        "/opt/joe-mcp/python/current/.secrets",
+        "/opt/joe-mcp/python/current/data/auth",
+        "/opt/joe-mcp/python/current/data/devices",
+        "/opt/joe-mcp/python/current/data/sessions",
     )
     value = str(target)
     if any(value == prefix or value.startswith(prefix + "/") for prefix in protected_cwds):

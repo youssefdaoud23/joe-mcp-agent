@@ -11,7 +11,7 @@ class AccessDenied(PermissionError):
     """Raised when a host path is outside Joe MCP's read policy."""
 
 
-PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp-server").rstrip("/") or "/opt/joe-mcp-server"
+PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp/python/current").rstrip("/") or "/opt/joe-mcp/python/current"
 
 
 SENSITIVE_COMPONENTS = {

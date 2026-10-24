@@ -1,9 +1,9 @@
-# Joe MCP Agent
+# Joe MCP Node - Python
 
-Lightweight managed-node runtime for Joe-MCP-Server.
+Lightweight managed-node runtime for Joe MCP Server - Python implementation.
 
-Version: `0.37.4`  
-Source controller commit: `37f933677ba8d44032f874e5cc65d0037a0e7c09`
+Version: `0.37.5`  
+Source controller commit: `03de506fcf7d04a10d2551fd7f455c4957bdecc8`
 
 This repository contains only the customer-node agent/runtime exported from the private Joe-MCP-Server source tree. It does **not** contain the Joe controller, customer web application, authentication database, tenant administration, MCP server, billing, or platform-admin code.
 
@@ -29,7 +29,7 @@ Joe-MCP-Server deliberately does not expose an unrestricted root shell, arbitrar
 
 ## Source of truth
 
-Do not edit exported runtime files independently. The private `joe-mcp-server` repository is the source of truth. Public releases are generated from its explicit managed-agent manifest and should be replaced by the next generated export rather than manually merged.
+Do not edit exported runtime files independently. The private `joe-mcp-server-python` repository is the source of truth. Public releases are generated from its explicit managed-agent manifest and should be replaced by the next generated export rather than manually merged.
 
 ## Security
 

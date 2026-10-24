@@ -1,10 +1,10 @@
 {
-  "agent_version": "0.37.4",
-  "bundle_sha256": "b2c26bff4374150282bb96a217cfdd4ecebb4774360e7107e12e7884747d97e4",
+  "agent_version": "0.37.5",
+  "bundle_sha256": "a04c54f7900809ece53fa26a1b8bcb536281031f652a1c02f6f60d4a6649be57",
   "generated": true,
   "managed_runtime_files": 56,
-  "name": "joe-mcp-agent",
+  "name": "joe-mcp-node-python",
   "schema_version": 1,
-  "source_commit": "37f933677ba8d44032f874e5cc65d0037a0e7c09",
+  "source_commit": "03de506fcf7d04a10d2551fd7f455c4957bdecc8",
   "source_private_repository": "joe-mcp-server"
 }

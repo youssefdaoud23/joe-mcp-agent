@@ -103,12 +103,12 @@ if [[ "${JOE_MANAGED_NODE:-0}" != "1" ]]; then
 fi
 
 if [[ ! -f /var/lib/joe-mcp-work/actions.json ]]; then
-  sed "s|/opt/joe-mcp-server|$escaped_root|g" "$ROOT/config/actions.json" > /var/lib/joe-mcp-work/actions.json
+  sed "s|/opt/joe-mcp/python/current|$escaped_root|g" "$ROOT/config/actions.json" > /var/lib/joe-mcp-work/actions.json
   chmod 0600 /var/lib/joe-mcp-work/actions.json
 fi
 
 if [[ ! -f "$WORKSPACE_FILE" ]]; then
-  sed "s|/opt/joe-mcp-server|$escaped_root|g" "$WORKSPACE_TEMPLATE" > "$WORKSPACE_FILE"
+  sed "s|/opt/joe-mcp/python/current|$escaped_root|g" "$WORKSPACE_TEMPLATE" > "$WORKSPACE_FILE"
   chmod 0600 "$WORKSPACE_FILE"
 fi
 

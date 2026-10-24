@@ -29,7 +29,7 @@ MAX_LOG_TEXT_FILTER = 500
 MAX_LOG_SINCE_MINUTES = 10_080
 MAX_LOG_STREAM_BYTES = 1_000_000
 MAX_LOG_MESSAGE_CHARS = 4000
-JOE_PROJECT_DIR = "/opt/joe-mcp-server"
+JOE_PROJECT_DIR = "/opt/joe-mcp/python/current"
 JOE_COMPOSE_FILE = f"{JOE_PROJECT_DIR}/docker-compose.yml"
 JOE_TUNNEL_CONTAINER = "joe-mcp-tunnel"
 
