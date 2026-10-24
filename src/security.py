@@ -11,7 +11,18 @@ class AccessDenied(PermissionError):
     """Raised when a host path is outside Joe MCP's read policy."""
 
 
-PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp/python/current").rstrip("/") or "/opt/joe-mcp/python/current"
+def default_project_root() -> str:
+    raw = str(Path(__file__).resolve().parents[1])
+    # Guarded controller self-tests execute host source through a /host bind mount.
+    # Normalize that container-only prefix back to the real host path. Managed nodes
+    # run directly from /opt/joe-node and therefore remain unchanged.
+    if raw.startswith("/host/"):
+        raw = raw[len("/host"):]
+    return raw.rstrip("/") or "/"
+
+
+DEFAULT_PROJECT_ROOT = default_project_root()
+PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", DEFAULT_PROJECT_ROOT).rstrip("/") or DEFAULT_PROJECT_ROOT
 
 
 SENSITIVE_COMPONENTS = {

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.security import default_project_root
+
 
 STATE_FILE = Path(os.getenv("JOE_ADMIN_TERMINAL_FILE", "/var/lib/joe-mcp-work/admin-terminal.json"))
 MAX_COMMAND_BYTES = 64 * 1024
@@ -72,14 +74,15 @@ def validate_request(command: str, cwd: str, confirm: bool = False) -> tuple[str
     target = Path(root).resolve(strict=False)
     if not target.exists() or not target.is_dir():
         raise AdminTerminalDenied("Admin terminal working directory must be an existing directory")
+    project = str(Path(os.getenv("JOE_PROJECT_ROOT", default_project_root())).resolve(strict=False))
     protected_cwds = (
         "/var/lib/joe-mcp-work/.secrets",
         "/var/lib/joe-mcp-work/sap",
         "/var/lib/joe-mcp-agent",
-        "/opt/joe-mcp/python/current/.secrets",
-        "/opt/joe-mcp/python/current/data/auth",
-        "/opt/joe-mcp/python/current/data/devices",
-        "/opt/joe-mcp/python/current/data/sessions",
+        f"{project}/.secrets",
+        f"{project}/data/auth",
+        f"{project}/data/devices",
+        f"{project}/data/sessions",
     )
     value = str(target)
     if any(value == prefix or value.startswith(prefix + "/") for prefix in protected_cwds):

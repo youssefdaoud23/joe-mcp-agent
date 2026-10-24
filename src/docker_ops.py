@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import time
 from typing import Any
 
 from src.action_policy import authorize_docker_action
-from src.security import redact_text
+from src.security import default_project_root, redact_text
 
 
 DOCKER_ENV = {
@@ -29,7 +30,7 @@ MAX_LOG_TEXT_FILTER = 500
 MAX_LOG_SINCE_MINUTES = 10_080
 MAX_LOG_STREAM_BYTES = 1_000_000
 MAX_LOG_MESSAGE_CHARS = 4000
-JOE_PROJECT_DIR = "/opt/joe-mcp/python/current"
+JOE_PROJECT_DIR = os.getenv("JOE_PROJECT_ROOT", default_project_root())
 JOE_COMPOSE_FILE = f"{JOE_PROJECT_DIR}/docker-compose.yml"
 JOE_TUNNEL_CONTAINER = "joe-mcp-tunnel"
 

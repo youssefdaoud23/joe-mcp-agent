@@ -3,14 +3,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from src.security import AccessDenied, normalize_host_path, safe_host_path
+from src.security import AccessDenied, default_project_root, normalize_host_path, safe_host_path
 
 
 class WriteDenied(PermissionError):
     """Raised when a path is outside Joe MCP's writable policy."""
 
 
-PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", "/opt/joe-mcp/python/current").rstrip("/") or "/opt/joe-mcp/python/current"
+DEFAULT_PROJECT_ROOT = default_project_root()
+PROJECT_ROOT = os.getenv("JOE_PROJECT_ROOT", DEFAULT_PROJECT_ROOT).rstrip("/") or DEFAULT_PROJECT_ROOT
 DEFAULT_WRITE_ROOTS = (PROJECT_ROOT, "/var/lib/joe-mcp-work")
 PROTECTED_PREFIXES = (
     f"{PROJECT_ROOT}/.git", f"{PROJECT_ROOT}/.secrets", f"{PROJECT_ROOT}/data/auth",
